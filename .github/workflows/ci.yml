@@ -74,20 +74,49 @@ jobs:
       - name: Test
         run: bun test
 
+  e2e:
+    name: End-to-end — scripts/e2e.sh
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [backend]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install backend deps
+        working-directory: backend
+        run: bun install --frozen-lockfile
+
+      - name: Run e2e smoke
+        run: ./scripts/e2e.sh
+
   # Aggregate check — GitHub branch protection points at this name.
   # Add new jobs above; add their name to `needs` to make merge-blocking.
   required:
     name: All checks
     runs-on: ubuntu-latest
-    needs: [ios, backend]
+    needs: [ios, backend, e2e]
     if: always()
     steps:
       - name: Verify required jobs succeeded
         run: |
-          if [ "${{ needs.ios.result }}" != "success" ] || [ "${{ needs.backend.result }}" != "success" ]; then
-            echo "Required jobs failed:"
-            echo "  ios:     ${{ needs.ios.result }}"
-            echo "  backend: ${{ needs.backend.result }}"
+          failed=0
+          for job in ios backend e2e; do
+            result_var="${job}_result"
+            case "$job" in
+              ios)     result="${{ needs.ios.result }}" ;;
+              backend) result="${{ needs.backend.result }}" ;;
+              e2e)     result="${{ needs.e2e.result }}" ;;
+            esac
+            echo "  $job: $result"
+            if [ "$result" != "success" ]; then failed=1; fi
+          done
+          if [ "$failed" = "1" ]; then
+            echo "Required jobs failed."
             exit 1
           fi
           echo "All required jobs passed."
