@@ -80,13 +80,15 @@ public enum EdgeProbe {
             _orgId = orgId
             _projectId = projectId
             if let endpoint {
-                _exporter = HTTPSpanExporter(endpoint: endpoint, apiKey: apiKey)
+                // Production wiring: trace() → BatchSpanProcessor → HTTPSpanExporter.
+                // The BSP sits on a ring buffer so `trace()` never blocks on network I/O
+                // (Critical Path #4) and drops oldest on overflow with a visible counter
+                // so a dead network can't OOM the host app (Critical Path #5).
+                let http = HTTPSpanExporter(endpoint: endpoint, apiKey: apiKey)
+                _exporter = BatchSpanProcessor(downstream: http)
             }
             _isStarted = true
             log.info("EdgeProbe initialized (exporter=\(endpoint?.absoluteString ?? "dry-run", privacy: .public))")
-            // TODO(next-commit): wire ring buffer with drop-oldest policy between
-            // trace() capture and HTTPSpanExporter. Without it, a network outage
-            // queues spans in URLSession's internal buffer and eventually OOMs.
         }
     }
 
