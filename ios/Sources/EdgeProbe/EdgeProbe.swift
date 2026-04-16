@@ -115,8 +115,45 @@ public enum EdgeProbe {
         startLock.sync { _exporter }
     }
 
+    /// Begin a multi-span trace. All spans created through the returned
+    /// `TraceHandle` share one traceId and flush as a single `IngestPayload`
+    /// on `handle.end()`.
+    ///
+    /// Use this for user-facing events composed of multiple stages — the
+    /// archetypal case is a voice turn (ASR → LLM → TTS). For one-off single-
+    /// span traces, the simpler `trace(_:)` static method is fine.
+    ///
+    /// ```swift
+    /// let turn = EdgeProbe.beginTrace()
+    /// let transcript = try await turn.span(.asr) { ... }
+    /// let reply      = try await turn.span(.llm) { ... }
+    /// try await turn.span(.tts) { ... }
+    /// turn.end()   // one POST /ingest, one trace, three spans
+    /// ```
+    public static func beginTrace(
+        sessionId: String? = nil,
+        attributes: [String: AttributeValue] = [:],
+        sensitive: Bool = false
+    ) -> TraceHandle {
+        let (exporter, orgId, projectId) = startLock.sync { (_exporter, _orgId, _projectId) }
+        return TraceHandle(
+            traceId: Self.makeHexId(16),
+            orgId: orgId,
+            projectId: projectId,
+            sessionId: sessionId,
+            startInstant: Date(),
+            exporter: exporter,
+            device: currentDeviceAttributes(),
+            traceAttributes: attributes,
+            isSensitive: sensitive
+        )
+    }
+
     /// Trace a block of on-device AI work. The span's duration, success/failure, and
     /// any opted-in content get captured and eventually exported to the backend.
+    ///
+    /// This is the single-span convenience. For multi-stage work that should
+    /// land under one traceId, use `beginTrace()` instead.
     ///
     /// - Parameters:
     ///   - kind: What this span represents (`.llm`, `.asr`, `.tts`, `.custom`).
@@ -192,7 +229,11 @@ public enum EdgeProbe {
     /// Build a hex id suitable for OTel trace_id (16 bytes = 32 hex chars) or
     /// span_id (8 bytes = 16 hex chars). Real OTel IdGenerator lands with
     /// opentelemetry-swift in month 13.
-    private static func makeHexId(_ bytes: Int) -> String {
+    ///
+    /// Internal so `TraceHandle.recordSpan` can stamp spans with ids without
+    /// duplicating the helper. Crypto-quality RNG for ids is overkill at Day 1;
+    /// collision at 16 random bytes per trace is not a real risk.
+    internal static func makeHexId(_ bytes: Int) -> String {
         var out = ""
         out.reserveCapacity(bytes * 2)
         for _ in 0..<bytes {
