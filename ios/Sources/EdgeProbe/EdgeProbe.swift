@@ -41,6 +41,9 @@ public enum EdgeProbe {
     private static let startLock = DispatchQueue(label: "dev.edgeprobe.sdk.start", qos: .userInitiated)
     nonisolated(unsafe) private static var _isStarted = false
     nonisolated(unsafe) private static var _apiKey: String?
+    nonisolated(unsafe) private static var _exporter: SpanExporter?
+    nonisolated(unsafe) private static var _orgId: String = "org_unknown"
+    nonisolated(unsafe) private static var _projectId: String = "proj_unknown"
 
     /// Number of times `start()` has been called. Useful for asserting idempotency in tests.
     /// Access on `startLock`.
@@ -52,9 +55,21 @@ public enum EdgeProbe {
 
     /// Initialize the SDK. Idempotent — safe to call more than once; subsequent calls are no-ops.
     ///
-    /// - Parameter apiKey: Your public ingest key (starts with `epk_pub_`).
-    ///   Safe to ship in the app binary — it is rate-limited and rotatable server-side.
-    public static func start(apiKey: String) {
+    /// - Parameters:
+    ///   - apiKey: Your public ingest key (starts with `epk_pub_`).
+    ///     Safe to ship in the app binary — rate-limited and rotatable server-side.
+    ///   - endpoint: Backend ingest URL. When `nil`, the SDK runs in dry-run
+    ///     mode: spans are captured and timed but nothing is sent. Useful in
+    ///     unit tests and while the SDK boots before a network is available.
+    ///   - orgId / projectId: Day-1 placeholders until the API key exchange
+    ///     endpoint lands in month 13. The server uses the key's associated
+    ///     org and the client-declared project name.
+    public static func start(
+        apiKey: String,
+        endpoint: URL? = nil,
+        orgId: String = "org_unknown",
+        projectId: String = "proj_unknown"
+    ) {
         startLock.sync {
             _startCallCount += 1
             guard !_isStarted else {
@@ -62,12 +77,29 @@ public enum EdgeProbe {
                 return
             }
             _apiKey = apiKey
+            _orgId = orgId
+            _projectId = projectId
+            if let endpoint {
+                _exporter = HTTPSpanExporter(endpoint: endpoint, apiKey: apiKey)
+            }
             _isStarted = true
-            log.info("EdgeProbe initialized")
-            // TODO(month-13): wire opentelemetry-swift BatchSpanProcessor on background queue.
-            // TODO(month-13): create ring buffer with drop-oldest policy.
-            // TODO(month-13): start background exporter.
+            log.info("EdgeProbe initialized (exporter=\(endpoint?.absoluteString ?? "dry-run", privacy: .public))")
+            // TODO(next-commit): wire ring buffer with drop-oldest policy between
+            // trace() capture and HTTPSpanExporter. Without it, a network outage
+            // queues spans in URLSession's internal buffer and eventually OOMs.
         }
+    }
+
+    /// Inject a custom exporter (used by tests to assert the wire payload).
+    /// Must be called after `start()`. Replaces the HTTP exporter.
+    internal static func __setExporterForTesting(_ exporter: SpanExporter) {
+        startLock.sync {
+            _exporter = exporter
+        }
+    }
+
+    internal static var __currentExporter: SpanExporter? {
+        startLock.sync { _exporter }
     }
 
     /// Trace a block of on-device AI work. The span's duration, success/failure, and
@@ -75,6 +107,7 @@ public enum EdgeProbe {
     ///
     /// - Parameters:
     ///   - kind: What this span represents (`.llm`, `.asr`, `.tts`, `.custom`).
+    ///   - name: Optional span name (e.g. "llama-decode"). Defaults to `kind.name`.
     ///   - includeContent: When `true`, prompt/completion/audio-transcript text
     ///     is uploaded to the backend and visible in the authenticated dashboard.
     ///     Default is `false`. Opting in does NOT make the span visible on public
@@ -84,16 +117,87 @@ public enum EdgeProbe {
     @discardableResult
     public static func trace<T>(
         _ kind: TraceKind,
+        name: String? = nil,
         includeContent: Bool = false,
         _ block: () throws -> T
     ) rethrows -> T {
-        let started = ContinuousClock.now
+        let startInstant = Date()
+        let startClock = ContinuousClock.now
+        let spanName = name ?? kind.name
+        var threw: Bool = false
         defer {
-            let elapsed = started.duration(to: ContinuousClock.now)
-            // TODO(month-13): create OTel span with gen_ai.* attributes, push to ring buffer.
-            log.debug("trace(\(kind.name)) completed in \(elapsed.components.attoseconds / 1_000_000_000, privacy: .public)ms (includeContent=\(includeContent, privacy: .public))")
+            let endInstant = Date()
+            let elapsedNs = startClock.duration(to: ContinuousClock.now).components.attoseconds / 1_000_000_000
+            let durationMs = Int(max(0, elapsedNs / 1_000_000))
+            log.debug("trace(\(spanName, privacy: .public)) \(durationMs, privacy: .public)ms")
+
+            let (exporter, orgId, projectId) = startLock.sync { (_exporter, _orgId, _projectId) }
+            if let exporter {
+                let traceId = Self.makeHexId(16)
+                let spanId = Self.makeHexId(8)
+                let iso = ISO8601DateFormatter()
+                iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+
+                let trace = TraceData(
+                    id: traceId,
+                    orgId: orgId,
+                    projectId: projectId,
+                    sessionId: nil,
+                    startedAt: iso.string(from: startInstant),
+                    endedAt: iso.string(from: endInstant),
+                    device: currentDeviceAttributes(),
+                    attributes: [:],
+                    sensitive: false
+                )
+                let span = SpanData(
+                    id: spanId,
+                    traceId: traceId,
+                    parentSpanId: nil,
+                    name: spanName,
+                    kind: kind.name,
+                    startedAt: iso.string(from: startInstant),
+                    endedAt: iso.string(from: endInstant),
+                    durationMs: durationMs,
+                    status: threw ? "error" : "ok",
+                    attributes: [:],
+                    includeContent: includeContent,
+                    promptText: nil,
+                    completionText: nil,
+                    transcriptText: nil
+                )
+                exporter.export(IngestPayload(trace: trace, spans: [span]))
+            }
         }
-        return try block()
+        do {
+            return try block()
+        } catch {
+            threw = true
+            throw error
+        }
+    }
+
+    /// Build a hex id suitable for OTel trace_id (16 bytes = 32 hex chars) or
+    /// span_id (8 bytes = 16 hex chars). Real OTel IdGenerator lands with
+    /// opentelemetry-swift in month 13.
+    private static func makeHexId(_ bytes: Int) -> String {
+        var out = ""
+        out.reserveCapacity(bytes * 2)
+        for _ in 0..<bytes {
+            out += String(format: "%02x", UInt8.random(in: 0...255))
+        }
+        return out
+    }
+
+    /// Minimal device attributes. Real impl reads UIDevice / sysctlbyname at
+    /// init and caches. Day 1: just mark us as iOS/macOS for the e2e demo.
+    private static func currentDeviceAttributes() -> [String: AttributeValue] {
+        #if os(iOS)
+        return ["device.os": .string("iOS"), "sdk.version": .string("0.0.1")]
+        #elseif os(macOS)
+        return ["device.os": .string("macOS"), "sdk.version": .string("0.0.1")]
+        #else
+        return ["device.os": .string("unknown"), "sdk.version": .string("0.0.1")]
+        #endif
     }
 
     // MARK: - Internal test hooks
@@ -113,6 +217,9 @@ public enum EdgeProbe {
         startLock.sync {
             _isStarted = false
             _apiKey = nil
+            _exporter = nil
+            _orgId = "org_unknown"
+            _projectId = "proj_unknown"
             _startCallCount = 0
         }
     }
