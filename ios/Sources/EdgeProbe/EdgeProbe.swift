@@ -42,6 +42,7 @@ public enum EdgeProbe {
     nonisolated(unsafe) private static var _isStarted = false
     nonisolated(unsafe) private static var _apiKey: String?
     nonisolated(unsafe) private static var _exporter: SpanExporter?
+    nonisolated(unsafe) private static var _lifecycleObserver: LifecycleObserver?
     nonisolated(unsafe) private static var _orgId: String = "org_unknown"
     nonisolated(unsafe) private static var _projectId: String = "proj_unknown"
 
@@ -85,7 +86,17 @@ public enum EdgeProbe {
                 // (Critical Path #4) and drops oldest on overflow with a visible counter
                 // so a dead network can't OOM the host app (Critical Path #5).
                 let http = HTTPSpanExporter(endpoint: endpoint, apiKey: apiKey)
-                _exporter = BatchSpanProcessor(downstream: http)
+                let bsp = BatchSpanProcessor(downstream: http)
+                _exporter = bsp
+
+                // Subscribe to UIApplication.didEnterBackgroundNotification so we
+                // force-flush the buffer before iOS suspends us. Without this, a
+                // user who locks their phone loses up to `flushInterval` seconds
+                // of telemetry — precisely the final spans an on-call engineer
+                // looking at a crash or hang wants most. No-op on non-iOS.
+                let observer = LifecycleObserver(processor: bsp)
+                observer.start()
+                _lifecycleObserver = observer
             }
             _isStarted = true
             log.info("EdgeProbe initialized (exporter=\(endpoint?.absoluteString ?? "dry-run", privacy: .public))")
@@ -220,9 +231,17 @@ public enum EdgeProbe {
             _isStarted = false
             _apiKey = nil
             _exporter = nil
+            _lifecycleObserver = nil  // deinit removes the NotificationCenter observer
             _orgId = "org_unknown"
             _projectId = "proj_unknown"
             _startCallCount = 0
         }
+    }
+
+    /// Test-only accessor for the lifecycle observer so tests can assert it
+    /// was registered and drive `flushForBackground()` directly without
+    /// waiting on a real UIApplication notification.
+    internal static var __currentLifecycleObserver: LifecycleObserver? {
+        startLock.sync { _lifecycleObserver }
     }
 }
