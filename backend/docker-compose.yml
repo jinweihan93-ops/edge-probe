@@ -1,0 +1,32 @@
+# Local Postgres for EdgeProbe dev + CI.
+#
+# Usage:
+#   docker compose up -d
+#   export DATABASE_URL="postgres://edgeprobe:edgeprobe@localhost:5433/edgeprobe"
+#   bun run dev
+#
+# Tests that hit Postgres read TEST_DATABASE_URL (same URL by default):
+#   export TEST_DATABASE_URL="$DATABASE_URL"
+#   bun test
+#
+# Port 5433 (not 5432) so this doesn't collide with a system Postgres.
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: edgeprobe-postgres
+    environment:
+      POSTGRES_USER: edgeprobe
+      POSTGRES_PASSWORD: edgeprobe
+      POSTGRES_DB: edgeprobe
+    ports:
+      - "5433:5432"
+    volumes:
+      - edgeprobe-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U edgeprobe -d edgeprobe"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+volumes:
+  edgeprobe-pgdata:

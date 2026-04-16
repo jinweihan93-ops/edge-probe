@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach } from "bun:test"
-import { createApp, makeDefaultDeps, type AppDeps } from "../src/server.ts"
+import { createApp, makeMemoryDeps, type AppDeps } from "../src/server.ts"
 import type { StoredSpan, Trace } from "../src/views.ts"
 
 /**
@@ -12,10 +12,10 @@ import type { StoredSpan, Trace } from "../src/views.ts"
 const TEST_SHARE_SECRET = "x".repeat(48)
 
 function freshDeps(): AppDeps {
-  return makeDefaultDeps({ shareTokenSecret: TEST_SHARE_SECRET })
+  return makeMemoryDeps(TEST_SHARE_SECRET)
 }
 
-function seedTraceWithContent(deps: AppDeps) {
+async function seedTraceWithContent(deps: AppDeps) {
   const trace: Trace = {
     id: "trace_abc",
     orgId: "org_acme",
@@ -27,7 +27,7 @@ function seedTraceWithContent(deps: AppDeps) {
     attributes: { "build.commit": "abc123" },
     sensitive: false,
   }
-  deps.store.insertTrace(trace)
+  await deps.store.insertTrace(trace)
 
   const promptSpan: StoredSpan = {
     id: "span_prompt",
@@ -50,7 +50,7 @@ function seedTraceWithContent(deps: AppDeps) {
     completionText: "THIS IS THE SECRET COMPLETION — DO NOT LEAK",
     transcriptText: "also secret audio transcript",
   }
-  deps.store.insertSpan(promptSpan)
+  await deps.store.insertSpan(promptSpan)
 
   return { trace, promptSpan }
 }
@@ -68,10 +68,10 @@ describe("Critical Path #1: public share never renders prompt/completion text", 
   let app: ReturnType<typeof createApp>
   let deps: AppDeps
 
-  beforeEach(() => {
+  beforeEach(async () => {
     deps = freshDeps()
     app = createApp(deps)
-    seedTraceWithContent(deps)
+    await seedTraceWithContent(deps)
   })
 
   test("GET /r/:token response JSON contains no content fields", async () => {
@@ -109,7 +109,7 @@ describe("Critical Path #1: public share never renders prompt/completion text", 
   })
 
   test("sensitive:true trace returns 404, not a redacted render", async () => {
-    deps.store.insertTrace({
+    await deps.store.insertTrace({
       id: "trace_sensitive",
       orgId: "org_acme",
       projectId: "proj_voice",
@@ -130,7 +130,7 @@ describe("Critical Path #3: per-call includeContent:true does not escalate publi
   test("even with includeContent:true, public view hides content", async () => {
     const deps = freshDeps()
     const app = createApp(deps)
-    seedTraceWithContent(deps) // stored span has includeContent: true and text fields populated
+    await seedTraceWithContent(deps) // stored span has includeContent: true and text fields populated
 
     const token = mintToken(deps)
     const pub = await (await app.request(`/r/${token}`)).json()
@@ -151,7 +151,7 @@ describe("Critical Path #2: cross-org access returns 403, not 404", () => {
   test("auth'd requester from another org gets 403 (not 404 — never leak existence)", async () => {
     const deps = freshDeps()
     const app = createApp(deps)
-    seedTraceWithContent(deps) // stored under org_acme
+    await seedTraceWithContent(deps) // stored under org_acme
 
     const res = await app.request("/app/trace/trace_abc", {
       headers: { "X-Org-Id": "org_competitor" },
@@ -171,7 +171,7 @@ describe("Critical Path #2: cross-org access returns 403, not 404", () => {
   test("unauthenticated request returns 401", async () => {
     const deps = freshDeps()
     const app = createApp(deps)
-    seedTraceWithContent(deps)
+    await seedTraceWithContent(deps)
 
     const res = await app.request("/app/trace/trace_abc")
     expect(res.status).toBe(401)
@@ -182,10 +182,10 @@ describe("Share tokens: /r/:token must be unforgeable, raw trace-ids do not work
   let deps: AppDeps
   let app: ReturnType<typeof createApp>
 
-  beforeEach(() => {
+  beforeEach(async () => {
     deps = freshDeps()
     app = createApp(deps)
-    seedTraceWithContent(deps)
+    await seedTraceWithContent(deps)
   })
 
   test("GET /r/<raw-traceId> returns 404 — not a token", async () => {
@@ -240,10 +240,10 @@ describe("POST /app/trace/:id/share: auth'd mint endpoint", () => {
   let deps: AppDeps
   let app: ReturnType<typeof createApp>
 
-  beforeEach(() => {
+  beforeEach(async () => {
     deps = freshDeps()
     app = createApp(deps)
-    seedTraceWithContent(deps)
+    await seedTraceWithContent(deps)
   })
 
   test("returns 201 with { token, url, expiresAt } for the owning org", async () => {

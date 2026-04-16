@@ -1,5 +1,8 @@
 import { Hono } from "hono"
-import { InMemorySpanStore, SpanViews, type Trace, type StoredSpan } from "./views.ts"
+import { InMemorySpanStore, SpanViews, type SpanStore, type Trace, type StoredSpan } from "./views.ts"
+import { PgSpanStore } from "./pgSpanStore.ts"
+import { createSQL } from "./db.ts"
+import { runMigrations } from "./migrate.ts"
 import {
   HmacShareTokenSigner,
   InvalidShareTokenError,
@@ -9,16 +12,20 @@ import {
 } from "./shareToken.ts"
 
 export interface AppDeps {
-  store: InMemorySpanStore
+  store: SpanStore
   views: SpanViews
   signer: ShareTokenSigner
 }
 
 /**
  * Build a Hono app. Factored this way so tests can construct an isolated
- * instance without shared state (and inject a test-only signer).
+ * instance without shared state (and inject a test-only signer + store).
+ *
+ * Handlers are all async because `SpanStore` is async — the in-memory version
+ * resolves immediately, the Postgres version actually awaits I/O. Same code,
+ * two deployments.
  */
-export function createApp(deps: AppDeps = makeDefaultDeps({ shareTokenSecret: requireShareSecret() })) {
+export function createApp(deps: AppDeps) {
   const { store, views, signer } = deps
   const app = new Hono()
 
@@ -47,9 +54,9 @@ export function createApp(deps: AppDeps = makeDefaultDeps({ shareTokenSecret: re
       return c.json({ error: "invalid ingest payload: need { trace, spans[] }" }, 400)
     }
 
-    store.insertTrace(body.trace)
+    await store.insertTrace(body.trace)
     for (const span of body.spans) {
-      store.insertSpan(span)
+      await store.insertSpan(span)
     }
 
     return c.json({ accepted: { traceId: body.trace.id, spanCount: body.spans.length } }, 202)
@@ -73,7 +80,7 @@ export function createApp(deps: AppDeps = makeDefaultDeps({ shareTokenSecret: re
       return c.json({ error: "unauthorized" }, 401)
     }
 
-    const trace = store.getTrace(id)
+    const trace = await store.getTrace(id)
     if (!trace) {
       return c.json({ error: "not found" }, 404)
     }
@@ -114,7 +121,7 @@ export function createApp(deps: AppDeps = makeDefaultDeps({ shareTokenSecret: re
    * a trace that doesn't exist, or points at a sensitive trace. They all
    * look identical from the outside. This is deliberate.
    */
-  app.get("/r/:token", (c) => {
+  app.get("/r/:token", async (c) => {
     const token = c.req.param("token")
     let payload
     try {
@@ -126,12 +133,12 @@ export function createApp(deps: AppDeps = makeDefaultDeps({ shareTokenSecret: re
       throw err
     }
 
-    const trace = store.getTrace(payload.traceId)
+    const trace = await store.getTrace(payload.traceId)
     if (!trace || trace.sensitive || trace.orgId !== payload.orgId) {
       return c.json({ error: "not found" }, 404)
     }
 
-    const spans = views.public_forTrace(trace.id)
+    const spans = await views.public_forTrace(trace.id)
     return c.json({
       trace: {
         id: trace.id,
@@ -148,14 +155,14 @@ export function createApp(deps: AppDeps = makeDefaultDeps({ shareTokenSecret: re
    * GET /app/trace/:id — authenticated dashboard view. Full content when opted in.
    * Cross-org scan returns 403, not 404 (Critical Path #2 — never leak existence).
    */
-  app.get("/app/trace/:id", (c) => {
+  app.get("/app/trace/:id", async (c) => {
     const id = c.req.param("id")
     const orgId = c.req.header("X-Org-Id") // stand-in for real session auth
     if (!orgId) {
       return c.json({ error: "unauthorized" }, 401)
     }
 
-    const trace = store.getTrace(id)
+    const trace = await store.getTrace(id)
     if (!trace) {
       return c.json({ error: "not found" }, 404)
     }
@@ -165,7 +172,7 @@ export function createApp(deps: AppDeps = makeDefaultDeps({ shareTokenSecret: re
       return c.json({ error: "forbidden" }, 403)
     }
 
-    const spans = views.private_forTrace(id, orgId)
+    const spans = await views.private_forTrace(id, orgId)
     return c.json({
       trace,
       spans,
@@ -175,11 +182,42 @@ export function createApp(deps: AppDeps = makeDefaultDeps({ shareTokenSecret: re
   return app
 }
 
-export function makeDefaultDeps(config: { shareTokenSecret: string }): AppDeps {
+/**
+ * Test-default deps: in-memory store, deterministic, zero I/O. Stays sync
+ * at construction time so tests can do `const deps = makeMemoryDeps(s)`
+ * without juggling await in every setup.
+ */
+export function makeMemoryDeps(shareTokenSecret: string): AppDeps {
   const store = new InMemorySpanStore()
   const views = new SpanViews(store)
-  const signer = new HmacShareTokenSigner(config.shareTokenSecret)
+  const signer = new HmacShareTokenSigner(shareTokenSecret)
   return { store, views, signer }
+}
+
+/**
+ * Production deps. If `databaseUrl` is set, connect to Postgres, run
+ * migrations, and return a Pg-backed store. Otherwise fall back to
+ * in-memory (useful for local smoke tests when PG isn't running, and for
+ * the `bun run src/server.ts` path in dev).
+ *
+ * Migrations run at boot. If they fail, the app doesn't start. Loud > quiet.
+ */
+export async function makeDefaultDeps(config: {
+  shareTokenSecret: string
+  databaseUrl?: string | undefined
+}): Promise<AppDeps> {
+  const signer = new HmacShareTokenSigner(config.shareTokenSecret)
+  if (config.databaseUrl) {
+    const sql = createSQL(config.databaseUrl)
+    const applied = await runMigrations(sql)
+    if (applied.length > 0) {
+      console.log(`[migrate] applied: ${applied.join(", ")}`)
+    }
+    const store = new PgSpanStore(sql)
+    return { store, views: new SpanViews(store), signer }
+  }
+  console.warn("[server] DATABASE_URL not set — using in-memory store (data lost on restart)")
+  return makeMemoryDeps(config.shareTokenSecret)
 }
 
 function requireShareSecret(): string {
@@ -195,7 +233,11 @@ function requireShareSecret(): string {
 
 // Allow `bun run src/server.ts` to boot the server directly.
 if (import.meta.main) {
-  const app = createApp()
+  const deps = await makeDefaultDeps({
+    shareTokenSecret: requireShareSecret(),
+    databaseUrl: process.env.DATABASE_URL,
+  })
+  const app = createApp(deps)
   const port = Number(process.env.PORT ?? 3000)
   console.log(`EdgeProbe backend listening on :${port}`)
   Bun.serve({ port, fetch: app.fetch })

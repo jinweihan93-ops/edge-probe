@@ -13,9 +13,10 @@
  * enforces at compile time that you cannot render a PrivateSpan on a public
  * endpoint and vice versa, because the response types differ.
  *
- * The storage layer is abstracted so we can swap from in-memory (Day 1) to
- * Postgres (month 13) without changing endpoint code. The views stay the same.
- * See src/schema.sql for the Postgres side of this same boundary.
+ * The storage layer is abstracted so we can swap from in-memory (fast tests)
+ * to Postgres (production) without changing endpoint code. The views stay
+ * the same. See src/pgSpanStore.ts and src/migrations/001_init.sql for the
+ * Postgres side of this same boundary.
  */
 
 // ----- Types at the boundary -----
@@ -97,34 +98,38 @@ function toPublicSpan(stored: StoredSpan): PublicSpan {
   }
 }
 
-// ----- Storage interface + in-memory implementation (Day 1) -----
+// ----- Storage interface + in-memory implementation -----
+//
+// `SpanStore` is async because the real implementation (PgSpanStore) needs
+// to await I/O. The in-memory version just returns resolved promises — the
+// overhead is a microtask per call, negligible.
 
 export interface SpanStore {
-  insertTrace(t: Trace): void
-  insertSpan(s: StoredSpan): void
-  getTrace(id: string): Trace | undefined
-  getSpansForTrace(traceId: string): StoredSpan[]
+  insertTrace(t: Trace): Promise<void>
+  insertSpan(s: StoredSpan): Promise<void>
+  getTrace(id: string): Promise<Trace | undefined>
+  getSpansForTrace(traceId: string): Promise<StoredSpan[]>
 }
 
 export class InMemorySpanStore implements SpanStore {
   private traces = new Map<string, Trace>()
   private spansByTrace = new Map<string, StoredSpan[]>()
 
-  insertTrace(t: Trace): void {
+  async insertTrace(t: Trace): Promise<void> {
     this.traces.set(t.id, t)
   }
 
-  insertSpan(s: StoredSpan): void {
+  async insertSpan(s: StoredSpan): Promise<void> {
     const list = this.spansByTrace.get(s.traceId) ?? []
     list.push(s)
     this.spansByTrace.set(s.traceId, list)
   }
 
-  getTrace(id: string): Trace | undefined {
+  async getTrace(id: string): Promise<Trace | undefined> {
     return this.traces.get(id)
   }
 
-  getSpansForTrace(traceId: string): StoredSpan[] {
+  async getSpansForTrace(traceId: string): Promise<StoredSpan[]> {
     return this.spansByTrace.get(traceId) ?? []
   }
 
@@ -143,10 +148,11 @@ export class SpanViews {
    * Public view — used ONLY by /r/{token}. Returns spans with content fields
    * absent from the type and the value. Sensitive traces return empty.
    */
-  public_forTrace(traceId: string): PublicSpan[] {
-    const trace = this.store.getTrace(traceId)
+  async public_forTrace(traceId: string): Promise<PublicSpan[]> {
+    const trace = await this.store.getTrace(traceId)
     if (!trace || trace.sensitive) return []
-    return this.store.getSpansForTrace(traceId).map(toPublicSpan)
+    const spans = await this.store.getSpansForTrace(traceId)
+    return spans.map(toPublicSpan)
   }
 
   /**
@@ -154,8 +160,8 @@ export class SpanViews {
    * including content when `includeContent: true` was set per-call on the SDK.
    * The caller is responsible for verifying the requester belongs to `trace.orgId`.
    */
-  private_forTrace(traceId: string, requestingOrgId: string): PrivateSpan[] {
-    const trace = this.store.getTrace(traceId)
+  async private_forTrace(traceId: string, requestingOrgId: string): Promise<PrivateSpan[]> {
+    const trace = await this.store.getTrace(traceId)
     if (!trace) return []
     if (trace.orgId !== requestingOrgId) {
       // Cross-org isolation: Critical Path #2 (403, not 404 — don't leak existence).
