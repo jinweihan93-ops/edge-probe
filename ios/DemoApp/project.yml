@@ -1,0 +1,71 @@
+name: VoiceProbe
+options:
+  bundleIdPrefix: dev.edgeprobe.demo
+  deploymentTarget:
+    iOS: "16.4"
+  developmentLanguage: en
+  createIntermediateGroups: true
+
+# SPM deps: the local EdgeProbe SDK by relative path + MLX-Swift-Examples
+# from GitHub. mlx-swift-examples re-exports MLX/MLXNN/MLXLLM/MLXLMCommon,
+# so depending on it transitively pulls everything we need for on-device Llama.
+packages:
+  EdgeProbe:
+    path: ..
+  mlx-swift-examples:
+    url: https://github.com/ml-explore/mlx-swift-examples
+    # Pin to a recent tag — mlx-swift-examples ships frequently and their API
+    # surface (LLMRegistry names, processor prepare shape) has evolved. Update
+    # this pin if you want to track HEAD; the README notes what to patch.
+    from: "2.21.0"
+
+targets:
+  VoiceProbe:
+    type: application
+    platform: iOS
+    sources:
+      - Sources
+      - Resources
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: VoiceProbe
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        UILaunchScreen:
+          UIColorName: AccentColor
+        UIRequiredDeviceCapabilities:
+          - arm64
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NSMicrophoneUsageDescription: "VoiceProbe records audio so Apple's on-device Speech framework can transcribe what you say. Audio never leaves your device."
+        NSSpeechRecognitionUsageDescription: "VoiceProbe transcribes your voice on-device via SFSpeechRecognizer so a local Llama model can respond. Nothing is sent to Apple's servers."
+        # Plaintext loopback so you can point at http://127.0.0.1:3000 during
+        # development without running a TLS proxy. Tighten or remove when you
+        # point VoiceProbe at a real backend.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        # These keys are read by Config.swift. Override in an .xcconfig or via
+        # an Xcode build scheme environment variable when you move off localhost.
+        EDGEPROBE_BACKEND_URL: "$(EDGEPROBE_BACKEND_URL)"
+        EDGEPROBE_WEB_URL: "$(EDGEPROBE_WEB_URL)"
+        EDGEPROBE_API_KEY: "$(EDGEPROBE_API_KEY)"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.edgeprobe.demo.VoiceProbe
+        TARGETED_DEVICE_FAMILY: "1"  # iPhone only; MLX-Llama is a lot to ask of an iPad too
+        SWIFT_VERSION: "6.0"
+        IPHONEOS_DEPLOYMENT_TARGET: "16.4"
+        ENABLE_PREVIEWS: YES
+        # Defaults wired through the Info.plist; users can override by
+        # exporting these before `xcodegen generate`.
+        EDGEPROBE_BACKEND_URL: "http://127.0.0.1:3000"
+        EDGEPROBE_WEB_URL: "http://127.0.0.1:3001"
+        EDGEPROBE_API_KEY: "epk_pub_demo_voiceprobe"
+    dependencies:
+      - package: EdgeProbe
+        product: EdgeProbe
+      - package: mlx-swift-examples
+        product: MLXLLM
+      - package: mlx-swift-examples
+        product: MLXLMCommon

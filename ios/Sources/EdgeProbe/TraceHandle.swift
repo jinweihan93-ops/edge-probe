@@ -165,13 +165,22 @@ public final class TraceHandle: @unchecked Sendable {
     }
 
     // MARK: - async span (for ASR, LLM, TTS — everything real)
+    //
+    // `@Sendable` on the closure parameter is what makes this pleasant to
+    // use from `@MainActor` sites (every real voice-turn caller is on main:
+    // the UI owns the mic button). `@MainActor` closures are implicitly
+    // `Sendable`, so they satisfy the constraint; nonisolated test closures
+    // that only capture Sendable state also satisfy it. Without it, Swift 6
+    // flags "sending non-Sendable closure risks a data race" at every
+    // caller. `T: Sendable` is required because the return hops back across
+    // the actor boundary.
 
     @discardableResult
-    public func span<T>(
+    public func span<T: Sendable>(
         _ kind: EdgeProbe.TraceKind,
         name: String? = nil,
         includeContent: Bool = false,
-        _ block: () async throws -> T
+        _ block: @Sendable @escaping () async throws -> T
     ) async rethrows -> T {
         let reporter = SpanReporter()
         return try await runAsync(kind: kind, name: name, includeContent: includeContent, reporter: reporter) {
@@ -180,11 +189,11 @@ public final class TraceHandle: @unchecked Sendable {
     }
 
     @discardableResult
-    public func span<T>(
+    public func span<T: Sendable>(
         _ kind: EdgeProbe.TraceKind,
         name: String? = nil,
         includeContent: Bool = false,
-        _ block: (SpanReporter) async throws -> T
+        _ block: @Sendable @escaping (SpanReporter) async throws -> T
     ) async rethrows -> T {
         let reporter = SpanReporter()
         return try await runAsync(kind: kind, name: name, includeContent: includeContent, reporter: reporter) {
@@ -271,7 +280,7 @@ public final class TraceHandle: @unchecked Sendable {
         name: String?,
         includeContent: Bool,
         reporter: SpanReporter,
-        _ work: () async throws -> T
+        _ work: @Sendable () async throws -> T
     ) async rethrows -> T {
         let started = Date()
         let startClock = ContinuousClock.now

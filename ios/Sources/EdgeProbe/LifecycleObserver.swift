@@ -38,47 +38,75 @@ internal final class LifecycleObserver: @unchecked Sendable {
     func start() {
         #if canImport(UIKit) && !os(watchOS)
         guard observer == nil else { return }
+        // queue: .main pins the callback to the main thread, which is where
+        // UIApplication.beginBackgroundTask must be invoked. MainActor.assumeIsolated
+        // then bridges that runtime guarantee into Swift 6's isolation model
+        // — no async hop, so the beginBackgroundTask window opens synchronously
+        // with the notification.
         observer = notificationCenter.addObserver(
             forName: UIApplication.didEnterBackgroundNotification,
             object: nil,
-            queue: nil
+            queue: .main
         ) { [weak self] _ in
-            self?.flushForBackground()
+            MainActor.assumeIsolated {
+                self?.flushForBackground()
+            }
         }
         Self.log.debug("LifecycleObserver registered for didEnterBackgroundNotification")
         #endif
     }
 
-    /// Drain the batch processor now, wrapped in a `beginBackgroundTask` on
-    /// iOS so iOS grants extra runtime before suspension. Exposed as
-    /// `internal` so tests can exercise the flush logic without UIKit in
-    /// the test environment.
+    #if canImport(UIKit) && !os(watchOS)
+    /// iOS path: wrap the drain in a `beginBackgroundTask` so iOS grants
+    /// extra runtime before suspension. `@MainActor` because `UIApplication`
+    /// is — Swift 6 strict concurrency requires it.
+    ///
+    /// Exposed `internal` so tests can drive the flush directly without a
+    /// real notification. Hosted iOS test targets must call this from a
+    /// `@MainActor` context; the existing tests run on macOS via SwiftPM
+    /// and hit the `#else` branch below.
+    @MainActor
     internal func flushForBackground() {
-        #if canImport(UIKit) && !os(watchOS)
-        // Request more time so the flush can drain before iOS suspends us.
-        // Task name shows up in Instruments traces, so make it specific.
-        var taskId: UIBackgroundTaskIdentifier = .invalid
-        taskId = UIApplication.shared.beginBackgroundTask(withName: "edgeprobe.flush") {
-            // Expiration handler — called if iOS runs out of patience.
-            // End the task so we don't get marked as a runaway background process.
-            if taskId != .invalid {
-                UIApplication.shared.endBackgroundTask(taskId)
-                taskId = .invalid
+        // Hold `taskId` in a MainActor-isolated reference type so the
+        // expiration handler's capture is safe in Swift 6 — a plain `var`
+        // captured across the beginBackgroundTask closure boundary is a
+        // data-race hazard even though UIKit fires the handler on main.
+        let holder = TaskHolder()
+        holder.taskId = UIApplication.shared.beginBackgroundTask(withName: "edgeprobe.flush") {
+            // Expiration handler: iOS runs it on main if we're taking too
+            // long. assumeIsolated bridges the runtime guarantee.
+            MainActor.assumeIsolated {
+                if holder.taskId != .invalid {
+                    UIApplication.shared.endBackgroundTask(holder.taskId)
+                    holder.taskId = .invalid
+                }
             }
         }
 
         processor.flushNow()
         processor.waitUntilIdle(timeout: 3.0)
 
-        if taskId != .invalid {
-            UIApplication.shared.endBackgroundTask(taskId)
+        if holder.taskId != .invalid {
+            UIApplication.shared.endBackgroundTask(holder.taskId)
         }
-        #else
-        // Non-iOS path: no background task concept, just drain.
+    }
+
+    /// MainActor-isolated box for the background task identifier. Exists
+    /// only so the expiration closure can mutate it without triggering a
+    /// Swift 6 data-race diagnostic on a captured `var`.
+    @MainActor
+    private final class TaskHolder {
+        var taskId: UIBackgroundTaskIdentifier = .invalid
+    }
+    #else
+    /// Non-iOS path: no background task concept, just drain. Kept
+    /// nonisolated so macOS/Linux unit tests drive it directly without
+    /// `@MainActor` boilerplate.
+    internal func flushForBackground() {
         processor.flushNow()
         processor.waitUntilIdle(timeout: 3.0)
-        #endif
     }
+    #endif
 
     /// Whether the OS notification observer is currently registered.
     /// Internal for tests; not part of the public API.
