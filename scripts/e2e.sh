@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# e2e.sh — end-to-end smoke: SDK wire shape ↔ backend contract.
+# e2e.sh — end-to-end smoke: SDK wire shape ↔ backend contract ↔ web dashboard.
 #
+# Backend checks:
 # 1. Start the Bun backend on a random port
 # 2. POST an IngestPayload shaped like the one EdgeProbe.trace() emits
 # 3. POST /app/trace/:id/share to mint a signed share token
@@ -10,17 +11,27 @@
 # 7. GET /app/trace/:id with a different org and assert 403 (not 404)
 # 8. GET /app/trace/:id with an unknown id and assert 404
 #
+# Web dashboard checks (HTML layer):
+# 9. Start the web server pointing at the backend
+# 10. GET web /r/<token> → 200 HTML, no prompt text in rendered body
+# 11. GET web /r/<bogus> → 404 HTML (single page for all failure modes)
+# 12. GET web /app/trace/:id?org=org_acme → 200 HTML, prompt text present
+# 13. GET web /app/trace/:id?org=org_competitor → 403 HTML, prompt text absent
+#
 # This script is the cold-start contract check. The Swift unit tests in
-# ios/Tests use URLProtocol mocks; this one talks to the real server.
-# Run before pushing any change that touches the wire format.
+# ios/Tests use URLProtocol mocks; this one talks to the real servers.
+# Run before pushing any change that touches the wire format or the rendered HTML.
 
 set -euo pipefail
 
 # ---- paths ----
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BACKEND_DIR="$REPO_ROOT/backend"
+WEB_DIR="$REPO_ROOT/web"
 PORT="${PORT:-38271}"
+WEB_PORT="${WEB_PORT:-38272}"
 BASE="http://127.0.0.1:$PORT"
+WEB_BASE="http://127.0.0.1:$WEB_PORT"
 
 # The backend refuses to boot without this. In prod it must be a real random
 # secret (`openssl rand -hex 32`). For the e2e smoke we just need something
@@ -34,7 +45,16 @@ echo "[e2e] starting backend on :$PORT"
 PORT="$PORT" SHARE_TOKEN_SECRET="$SHARE_TOKEN_SECRET" \
   bun run start >/tmp/edgeprobe-e2e-server.log 2>&1 &
 SERVER_PID=$!
-trap 'echo "[e2e] killing backend ($SERVER_PID)"; kill "$SERVER_PID" 2>/dev/null || true' EXIT
+WEB_PID=""
+cleanup() {
+  if [ -n "$WEB_PID" ]; then
+    echo "[e2e] killing web ($WEB_PID)"
+    kill "$WEB_PID" 2>/dev/null || true
+  fi
+  echo "[e2e] killing backend ($SERVER_PID)"
+  kill "$SERVER_PID" 2>/dev/null || true
+}
+trap cleanup EXIT
 
 # wait for /healthz (up to 10s)
 for i in $(seq 1 50); do
@@ -171,5 +191,96 @@ if [ "$NOT_FOUND_STATUS" != "404" ]; then
 fi
 echo "[e2e]   → missing trace returns 404 ✓"
 
+# ======================================================================
+# Web dashboard: same checks, against the rendered HTML surface.
+# Starts a second process pointing at the backend we just exercised.
+# ======================================================================
+
 echo
-echo "[e2e] ALL CHECKS PASSED — SDK↔backend contract holds, PII boundary enforced, share tokens required"
+echo "[e2e] starting web dashboard on :$WEB_PORT (backend=$BASE)"
+cd "$WEB_DIR"
+PORT="$WEB_PORT" BACKEND_URL="$BASE" \
+  bun run start >/tmp/edgeprobe-e2e-web.log 2>&1 &
+WEB_PID=$!
+
+for i in $(seq 1 50); do
+  if curl -fsS "$WEB_BASE/healthz" >/dev/null 2>&1; then break; fi
+  sleep 0.2
+  if [ "$i" -eq 50 ]; then
+    echo "[e2e] web didn't come up in 10s; log:" >&2
+    cat /tmp/edgeprobe-e2e-web.log >&2
+    exit 1
+  fi
+done
+echo "[e2e] web up"
+
+# ---- 9. GET web /r/<token> — must render HTML, must not contain prompts ----
+echo "[e2e] GET $WEB_BASE/r/<token>"
+curl -fsS "$WEB_BASE/r/$SHARE_TOKEN" > /tmp/edgeprobe-web-public.html
+if ! grep -q "<html" /tmp/edgeprobe-web-public.html; then
+  echo "[e2e] FAIL: public page didn't render HTML" >&2
+  head -c 2000 /tmp/edgeprobe-web-public.html >&2
+  exit 1
+fi
+if grep -q "SECRET USER PROMPT" /tmp/edgeprobe-web-public.html; then
+  echo "[e2e] FAIL: public HTML contains prompt text — PII BOUNDARY BREACH at view layer" >&2
+  exit 1
+fi
+if grep -q "SECRET COMPLETION" /tmp/edgeprobe-web-public.html; then
+  echo "[e2e] FAIL: public HTML contains completion text — PII BOUNDARY BREACH at view layer" >&2
+  exit 1
+fi
+# Positive: the hero tiles and waterfall must have rendered.
+if ! grep -q "metric-tile" /tmp/edgeprobe-web-public.html; then
+  echo "[e2e] FAIL: public HTML is missing hero metric tiles" >&2
+  exit 1
+fi
+if ! grep -q "waterfall" /tmp/edgeprobe-web-public.html; then
+  echo "[e2e] FAIL: public HTML is missing waterfall" >&2
+  exit 1
+fi
+echo "[e2e]   → public HTML renders, no prompt text ✓"
+
+# ---- 10. GET web /r/<bogus> — single 404 page for every failure mode ----
+echo "[e2e] GET $WEB_BASE/r/<bogus-token>"
+BOGUS_STATUS=$(curl -sS -o /tmp/edgeprobe-web-404.html -w "%{http_code}" "$WEB_BASE/r/bogus.token")
+if [ "$BOGUS_STATUS" != "404" ]; then
+  echo "[e2e] FAIL: bogus token returned $BOGUS_STATUS, expected 404" >&2
+  exit 1
+fi
+if ! grep -q "Not found" /tmp/edgeprobe-web-404.html; then
+  echo "[e2e] FAIL: 404 page missing 'Not found' copy" >&2
+  exit 1
+fi
+echo "[e2e]   → bogus token → 404 HTML ✓"
+
+# ---- 11. GET web /app/trace/:id?org=<owning> — prompt text MUST be visible ----
+echo "[e2e] GET $WEB_BASE/app/trace/$TRACE_ID?org=org_acme"
+curl -fsS "$WEB_BASE/app/trace/$TRACE_ID?org=org_acme" > /tmp/edgeprobe-web-private.html
+if ! grep -q "SECRET USER PROMPT" /tmp/edgeprobe-web-private.html; then
+  echo "[e2e] FAIL: auth'd HTML is missing opted-in prompt text" >&2
+  head -c 2000 /tmp/edgeprobe-web-private.html >&2
+  exit 1
+fi
+if ! grep -q "Captured content" /tmp/edgeprobe-web-private.html; then
+  echo "[e2e] FAIL: auth'd HTML is missing the Captured content block" >&2
+  exit 1
+fi
+echo "[e2e]   → auth'd HTML shows content ✓"
+
+# ---- 12. GET web /app/trace/:id?org=<other> — 403 and no prompt text ----
+echo "[e2e] GET $WEB_BASE/app/trace/$TRACE_ID?org=org_competitor"
+CROSS_STATUS=$(curl -sS -o /tmp/edgeprobe-web-cross.html -w "%{http_code}" \
+  "$WEB_BASE/app/trace/$TRACE_ID?org=org_competitor")
+if [ "$CROSS_STATUS" != "403" ]; then
+  echo "[e2e] FAIL: cross-org web request returned $CROSS_STATUS, expected 403" >&2
+  exit 1
+fi
+if grep -q "SECRET USER PROMPT" /tmp/edgeprobe-web-cross.html; then
+  echo "[e2e] FAIL: cross-org HTML leaked prompt text — PII BOUNDARY BREACH" >&2
+  exit 1
+fi
+echo "[e2e]   → cross-org → 403, no prompt text ✓"
+
+echo
+echo "[e2e] ALL CHECKS PASSED — backend contract holds, web dashboard renders, PII boundary enforced at both layers"

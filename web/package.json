@@ -1,0 +1,19 @@
+{
+  "name": "@edgeprobe/web",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun run --hot src/server.tsx",
+    "start": "bun run src/server.tsx",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "hono": "^4.6.14"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.6.3"
+  }
+}

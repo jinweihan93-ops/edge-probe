@@ -1,0 +1,208 @@
+import { describe, test, expect } from "bun:test"
+import { Hono } from "hono"
+import { createWebApp, type WebDeps } from "../src/server.tsx"
+import type {
+  PublicTraceResponse,
+  PrivateTraceResponse,
+  BackendClient,
+} from "../src/lib/backend.ts"
+
+/**
+ * View-layer PII boundary tests.
+ *
+ * The backend already enforces that `/r/:token` responses carry no content.
+ * These tests prove the web layer does not somehow reintroduce content on
+ * the public page (e.g. by pulling it from another endpoint, by fallback
+ * rendering, by error messages echoing request bodies).
+ *
+ * Shape: stub the BackendClient, hand the web app fake responses where
+ * public + private responses are BOTH populated with SECRET text (so we
+ * could detect a cross-wiring bug where the public route accidentally
+ * queried the private endpoint).
+ */
+
+const SECRET = "THIS-IS-SECRET-USER-PROMPT-TEXT"
+
+function makeApp(overrides: Partial<BackendClient> = {}): { app: Hono } {
+  const fakeBackend: BackendClient = {
+    fetchPublic: async () => publicResponse(),
+    fetchPrivate: async () => ({ status: 200, body: privateResponse() }),
+    ...overrides,
+  } as BackendClient
+
+  const deps: WebDeps = { backend: fakeBackend }
+  return { app: createWebApp(deps) }
+}
+
+function publicResponse(): PublicTraceResponse {
+  return {
+    trace: {
+      id: "trace_t1",
+      startedAt: "2026-04-15T12:00:00.000Z",
+      endedAt: "2026-04-15T12:00:00.600Z",
+      device: { model: "iPhone 15 Pro", os: "iOS 18.2" },
+      attributes: {},
+    },
+    spans: [
+      {
+        id: "s1",
+        traceId: "trace_t1",
+        parentSpanId: null,
+        name: "llama",
+        kind: "llm",
+        startedAt: "2026-04-15T12:00:00.000Z",
+        endedAt: "2026-04-15T12:00:00.600Z",
+        durationMs: 600,
+        status: "ok",
+        // Content fields are NOT present on a PublicSpan — this matches the
+        // backend's /r/:token response shape exactly.
+        attributes: { "gen_ai.request.model": "llama-3.2-3b" },
+      },
+    ],
+  }
+}
+
+function privateResponse(): PrivateTraceResponse {
+  return {
+    trace: {
+      id: "trace_t1",
+      orgId: "org_acme",
+      projectId: "proj_voice",
+      sessionId: null,
+      startedAt: "2026-04-15T12:00:00.000Z",
+      endedAt: "2026-04-15T12:00:00.600Z",
+      device: { model: "iPhone 15 Pro", os: "iOS 18.2" },
+      attributes: {},
+      sensitive: false,
+    },
+    spans: [
+      {
+        id: "s1",
+        traceId: "trace_t1",
+        parentSpanId: null,
+        name: "llama",
+        kind: "llm",
+        startedAt: "2026-04-15T12:00:00.000Z",
+        endedAt: "2026-04-15T12:00:00.600Z",
+        durationMs: 600,
+        status: "ok",
+        attributes: { "gen_ai.request.model": "llama-3.2-3b" },
+        includeContent: true,
+        promptText: SECRET,
+        completionText: SECRET + "-completion",
+        transcriptText: null,
+      },
+    ],
+  }
+}
+
+describe("Public share HTML — PII boundary at view layer", () => {
+  test("GET /r/:token renders HTML with 200 and metric tiles", async () => {
+    const { app } = makeApp()
+    const res = await app.request("/r/any-token")
+    expect(res.status).toBe(200)
+    const html = await res.text()
+    expect(html).toContain("<html")
+    expect(html).toContain("metric-tile")
+    expect(html).toContain("waterfall")
+    expect(html).toContain("llama-3.2-3b")
+  })
+
+  test("GET /r/:token HTML contains no SECRET strings even if the fake backend sent them", async () => {
+    const { app } = makeApp({
+      // Hostile backend: returns prompt text on the public endpoint (shouldn't happen,
+      // but proves our view layer doesn't look for it).
+      fetchPublic: async () =>
+        ({
+          ...publicResponse(),
+          spans: [
+            // Cast because PublicSpan type does NOT have content fields.
+            // We're forcing the stub to include them to prove the view layer ignores them.
+            { ...publicResponse().spans[0], promptText: SECRET, completionText: SECRET } as unknown as PublicTraceResponse["spans"][0],
+          ],
+        }) as PublicTraceResponse,
+    } as Partial<BackendClient>)
+    const res = await app.request("/r/any-token")
+    const html = await res.text()
+    expect(html).not.toContain(SECRET)
+  })
+
+  test("GET /r/:token returns 404 HTML when backend says no", async () => {
+    const { app } = makeApp({
+      fetchPublic: async () => null,
+    } as Partial<BackendClient>)
+    const res = await app.request("/r/bogus")
+    expect(res.status).toBe(404)
+    const html = await res.text()
+    expect(html).toContain("Not found")
+    // The copy deliberately lists multiple possible reasons (expired / revoked /
+    // never existed) without committing to one — an attacker cannot tell which
+    // failure mode fired. So we check the opposite: no definite language that
+    // would out a specific failure.
+    expect(html).not.toContain("Token is tampered")
+    expect(html).not.toContain("This trace is sensitive")
+    expect(html).not.toContain("Signature invalid")
+  })
+})
+
+describe("Private trace HTML — auth'd dashboard", () => {
+  test("GET /app/trace/:id with ?org= renders content block containing prompt text", async () => {
+    const { app } = makeApp()
+    const res = await app.request("/app/trace/trace_t1?org=org_acme")
+    expect(res.status).toBe(200)
+    const html = await res.text()
+    expect(html).toContain("Captured content")
+    expect(html).toContain(SECRET) // the prompt text IS visible to the authed org
+    expect(html).toContain("content-block__body")
+  })
+
+  test("GET /app/trace/:id without any org context renders 401 not-found", async () => {
+    const { app } = makeApp()
+    const res = await app.request("/app/trace/trace_t1")
+    expect(res.status).toBe(401)
+    const html = await res.text()
+    expect(html).toContain("Not found")
+  })
+
+  test("GET /app/trace/:id when backend returns 403 renders not-found (never leak existence)", async () => {
+    const { app } = makeApp({
+      fetchPrivate: async () => ({ status: 403, body: null }),
+    } as Partial<BackendClient>)
+    const res = await app.request("/app/trace/trace_t1?org=org_competitor")
+    expect(res.status).toBe(403)
+    const html = await res.text()
+    expect(html).toContain("Not found")
+    expect(html).not.toContain("forbidden")
+  })
+
+  test("GET /app/trace/:id when backend returns 404 renders not-found", async () => {
+    const { app } = makeApp({
+      fetchPrivate: async () => ({ status: 404, body: null }),
+    } as Partial<BackendClient>)
+    const res = await app.request("/app/trace/nope?org=org_acme")
+    expect(res.status).toBe(404)
+  })
+})
+
+describe("OG + social unfurl metadata", () => {
+  test("public page declares og:title + og:description that carry no prompt text", async () => {
+    const { app } = makeApp()
+    const res = await app.request("/r/tok")
+    const html = await res.text()
+    expect(html).toContain('property="og:title"')
+    expect(html).toContain('property="og:description"')
+    const ogDescMatch = html.match(/property="og:description" content="([^"]+)"/)
+    expect(ogDescMatch).not.toBeNull()
+    expect(ogDescMatch![1]).not.toContain(SECRET)
+    expect(ogDescMatch![1]).toMatch(/\d+ ms turn/)
+  })
+})
+
+describe("Healthz", () => {
+  test("GET /healthz returns ok", async () => {
+    const { app } = makeApp()
+    const res = await app.request("/healthz")
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ ok: true })
+  })
+})
