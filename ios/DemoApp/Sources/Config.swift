@@ -43,10 +43,28 @@ enum Config {
         return "epk_pub_demo_voiceprobe"
     }()
 
+    /// Dashboard bearer key. Used ONLY for the share-mint call
+    /// (`POST /app/trace/:id/share`) — the ingest path uses `apiKey` above.
+    /// This key maps to `orgId` via the backend's `DASHBOARD_KEYS` table.
+    ///
+    /// In a real product the device would NOT carry this; the user would
+    /// tap "share" in the dashboard web UI, which would mint from a
+    /// session-authed origin. For the demo we let the device mint directly
+    /// so the whole path — trace → dashboard → share URL — fits in one
+    /// tap. Don't ship this key with a public app.
+    static let dashboardKey: String = {
+        if let raw = Bundle.main.object(forInfoDictionaryKey: "EDGEPROBE_DASHBOARD_KEY") as? String, !raw.isEmpty {
+            return raw
+        }
+        return "epk_dash_acme_test_0000000000000000"
+    }()
+
     /// Which org these demo traces belong to. Matches the backend/web e2e
     /// script's `org_acme` so a fresh clone "just works" against a local
     /// backend — you don't have to provision a new org before you can see
-    /// your first trace.
+    /// your first trace. The dashboard key above is what actually proves
+    /// identity on the wire; this constant is only used to stamp the
+    /// `trace.orgId` field the SDK sends on ingest.
     static let orgId = "org_acme"
 
     /// Which project in that org. The dashboard filter (once we ship it)

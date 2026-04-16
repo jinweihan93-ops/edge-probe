@@ -23,14 +23,20 @@ import type {
 
 const SECRET = "THIS-IS-SECRET-USER-PROMPT-TEXT"
 
-function makeApp(overrides: Partial<BackendClient> = {}): { app: Hono } {
+function makeApp(
+  overrides: Partial<BackendClient> = {},
+  orgBearers: Map<string, string> = new Map([
+    ["org_acme", "epk_dash_acme_test_render_xxxxxxxxxx"],
+    ["org_competitor", "epk_dash_comp_test_render_xxxxxxxxx"],
+  ]),
+): { app: Hono } {
   const fakeBackend: BackendClient = {
     fetchPublic: async () => publicResponse(),
     fetchPrivate: async () => ({ status: 200, body: privateResponse() }),
     ...overrides,
   } as BackendClient
 
-  const deps: WebDeps = { backend: fakeBackend }
+  const deps: WebDeps = { backend: fakeBackend, orgBearers }
   return { app: createWebApp(deps) }
 }
 
@@ -157,8 +163,20 @@ describe("Private trace HTML — auth'd dashboard", () => {
   })
 
   test("GET /app/trace/:id without any org context renders 401 not-found", async () => {
-    const { app } = makeApp()
+    // Empty orgBearers — the caller has no session, so there's no implicit
+    // single-org default to fall back on.
+    const { app } = makeApp({}, new Map())
     const res = await app.request("/app/trace/trace_t1")
+    expect(res.status).toBe(401)
+    const html = await res.text()
+    expect(html).toContain("Not found")
+  })
+
+  test("GET /app/trace/:id with ?org= for an org we have no bearer for → 401 not-found", async () => {
+    // Prevents "flip the query param to probe a foreign org's traces".
+    // Only orgs present in orgBearers are reachable.
+    const { app } = makeApp({}, new Map([["org_acme", "epk_dash_acme_test_0000000000000000"]]))
+    const res = await app.request("/app/trace/trace_t1?org=org_stranger")
     expect(res.status).toBe(401)
     const html = await res.text()
     expect(html).toContain("Not found")

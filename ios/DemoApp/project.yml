@@ -50,6 +50,7 @@ targets:
         EDGEPROBE_BACKEND_URL: "$(EDGEPROBE_BACKEND_URL)"
         EDGEPROBE_WEB_URL: "$(EDGEPROBE_WEB_URL)"
         EDGEPROBE_API_KEY: "$(EDGEPROBE_API_KEY)"
+        EDGEPROBE_DASHBOARD_KEY: "$(EDGEPROBE_DASHBOARD_KEY)"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.edgeprobe.demo.VoiceProbe
@@ -62,6 +63,10 @@ targets:
         EDGEPROBE_BACKEND_URL: "http://127.0.0.1:3000"
         EDGEPROBE_WEB_URL: "http://127.0.0.1:3001"
         EDGEPROBE_API_KEY: "epk_pub_demo_voiceprobe"
+        # Must match one of the keys the backend launches with in its
+        # DASHBOARD_KEYS env var. The value below matches the test default
+        # so `bun run start` + VoiceProbe "just works" against a fresh clone.
+        EDGEPROBE_DASHBOARD_KEY: "epk_dash_acme_test_0000000000000000"
     dependencies:
       - package: EdgeProbe
         product: EdgeProbe

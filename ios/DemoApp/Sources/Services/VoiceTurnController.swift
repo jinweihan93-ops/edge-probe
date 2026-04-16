@@ -121,9 +121,15 @@ final class VoiceTurnController: ObservableObject {
     }
 
     /// Mint a public share URL for the most recent turn by calling the
-    /// backend's /app/trace/:id/share. The orgId header proves ownership.
+    /// backend's /app/trace/:id/share. Auth is a bearer that maps to the
+    /// org server-side — the device doesn't self-assert an orgId anymore.
     /// Returns the full `/r/<token>` URL or nil if the call fails — kept
     /// out of the trace path so a dead backend can't block the UI.
+    ///
+    /// `201 Created` is the success contract from the backend; the previous
+    /// code checked for 200, which was never actually returned. Harmless
+    /// when paired with the old auth (both branches 401'd or succeeded),
+    /// but worth fixing now that the wire is tightening up.
     func shareLastTurn() async -> URL? {
         guard let last = lastTurn else { return nil }
         var req = URLRequest(url: Config.backendURL
@@ -134,11 +140,11 @@ final class VoiceTurnController: ObservableObject {
         )
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue(Config.orgId, forHTTPHeaderField: "X-Org-Id")
+        req.setValue("Bearer \(Config.dashboardKey)", forHTTPHeaderField: "Authorization")
         req.httpBody = Data("{}".utf8)
 
         guard let (data, resp) = try? await URLSession.shared.data(for: req),
-              let http = resp as? HTTPURLResponse, http.statusCode == 200,
+              let http = resp as? HTTPURLResponse, http.statusCode == 201,
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let token = json["token"] as? String else {
             return nil

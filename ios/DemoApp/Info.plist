@@ -24,6 +24,8 @@
 	<string>$(EDGEPROBE_API_KEY)</string>
 	<key>EDGEPROBE_BACKEND_URL</key>
 	<string>$(EDGEPROBE_BACKEND_URL)</string>
+	<key>EDGEPROBE_DASHBOARD_KEY</key>
+	<string>$(EDGEPROBE_DASHBOARD_KEY)</string>
 	<key>EDGEPROBE_WEB_URL</key>
 	<string>$(EDGEPROBE_WEB_URL)</string>
 	<key>NSAppTransportSecurity</key>

@@ -19,9 +19,22 @@ mic ──► SFSpeechRecognizer ──► Llama-3.2-1B-Instruct-4bit (MLX) ─�
 
   ```bash
   # in two separate terminals from the repo root
-  cd backend && SHARE_TOKEN_SECRET=$(openssl rand -hex 32) bun run start      # :3000
-  cd web     && BACKEND_URL=http://127.0.0.1:3000 bun run start               # :3001
+  cd backend && \
+    SHARE_TOKEN_SECRET=$(openssl rand -hex 32) \
+    DASHBOARD_KEYS='{"epk_dash_acme_test_0000000000000000":"org_acme"}' \
+    bun run start                                                             # :3000
+
+  cd web && \
+    BACKEND_URL=http://127.0.0.1:3000 \
+    ORG_BEARERS='{"org_acme":"epk_dash_acme_test_0000000000000000"}' \
+    bun run start                                                             # :3001
   ```
+
+  `DASHBOARD_KEYS` and `ORG_BEARERS` are mirror images — the backend
+  matches bearer → orgId, the web process flips it to resolve
+  `?org=foo` → bearer for the backend call. The default
+  `EDGEPROBE_DASHBOARD_KEY` in `project.yml` matches the key above so a
+  fresh clone works without extra config.
 
 ## Run it
 
@@ -110,8 +123,9 @@ any of that — replace the two MLX calls and the trace will keep shape.
 
 ## What this demo does not prove
 
-- **API key auth**: the backend still accepts any `epk_pub_*` string.
-  The next slice on `main` closes that hole.
+- **Ingest key verification**: the backend still accepts any `epk_pub_*`
+  string on `/ingest`. Dashboard auth on `/app/*` is now bearer-verified
+  (as of the auth slice), but device-side ingest keys are still scaffolding.
 - **Network resilience**: `HTTPSpanExporter` has no retries yet; a dead
   backend logs an error and drops the span. The RingBuffer + BatchSpanProcessor
   behind the exporter handle drop-oldest, but the exporter itself is

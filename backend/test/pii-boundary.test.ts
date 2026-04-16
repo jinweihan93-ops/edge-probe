@@ -1,15 +1,24 @@
 import { describe, test, expect, beforeEach } from "bun:test"
 import { createApp, makeMemoryDeps, type AppDeps } from "../src/server.ts"
 import type { StoredSpan, Trace } from "../src/views.ts"
+import {
+  TEST_DASHBOARD_KEY_ACME,
+  TEST_DASHBOARD_KEY_COMPETITOR,
+} from "../src/auth.ts"
 
 /**
  * PII boundary regression tests — the six Critical Paths, minus the iOS-only ones.
  * These guard the whole product. They run in CI, they block merge.
  *
  * If any of these fail, EdgeProbe leaks user prompts. The product is dead.
+ *
+ * Dashboard auth: `/app/*` uses `Authorization: Bearer epk_dash_...` where
+ * the bearer maps to an orgId via the boot-time table. See src/auth.ts.
  */
 
 const TEST_SHARE_SECRET = "x".repeat(48)
+const BEARER_ACME = { Authorization: `Bearer ${TEST_DASHBOARD_KEY_ACME}` }
+const BEARER_COMP = { Authorization: `Bearer ${TEST_DASHBOARD_KEY_COMPETITOR}` }
 
 function freshDeps(): AppDeps {
   return makeMemoryDeps(TEST_SHARE_SECRET)
@@ -139,7 +148,7 @@ describe("Critical Path #3: per-call includeContent:true does not escalate publi
 
     // And the private view DOES have it (authed requester from same org)
     const priv = await (
-      await app.request("/app/trace/trace_abc", { headers: { "X-Org-Id": "org_acme" } })
+      await app.request("/app/trace/trace_abc", { headers: BEARER_ACME })
     ).json()
     const privRaw = JSON.stringify(priv)
     expect(privRaw).toContain("SECRET USER PROMPT")
@@ -154,7 +163,7 @@ describe("Critical Path #2: cross-org access returns 403, not 404", () => {
     await seedTraceWithContent(deps) // stored under org_acme
 
     const res = await app.request("/app/trace/trace_abc", {
-      headers: { "X-Org-Id": "org_competitor" },
+      headers: BEARER_COMP,
     })
     expect(res.status).toBe(403)
 
@@ -163,7 +172,7 @@ describe("Critical Path #2: cross-org access returns 403, not 404", () => {
     // 403 on wrong-org matters: the response codes are DIFFERENT on purpose,
     // and wrong-org must NEVER fall through to the "not found" path.
     const missing = await app.request("/app/trace/trace_nope", {
-      headers: { "X-Org-Id": "org_competitor" },
+      headers: BEARER_COMP,
     })
     expect(missing.status).toBe(404)
   })
@@ -249,7 +258,7 @@ describe("POST /app/trace/:id/share: auth'd mint endpoint", () => {
   test("returns 201 with { token, url, expiresAt } for the owning org", async () => {
     const res = await app.request("/app/trace/trace_abc/share", {
       method: "POST",
-      headers: { "X-Org-Id": "org_acme", "Content-Type": "application/json" },
+      headers: { ...BEARER_ACME, "Content-Type": "application/json" },
       body: JSON.stringify({}),
     })
     expect(res.status).toBe(201)
@@ -264,7 +273,7 @@ describe("POST /app/trace/:id/share: auth'd mint endpoint", () => {
     expect(pub.status).toBe(200)
   })
 
-  test("returns 401 without X-Org-Id", async () => {
+  test("returns 401 without Authorization header", async () => {
     const res = await app.request("/app/trace/trace_abc/share", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -273,10 +282,22 @@ describe("POST /app/trace/:id/share: auth'd mint endpoint", () => {
     expect(res.status).toBe(401)
   })
 
+  test("returns 401 with a Bearer value that isn't a known dashboard key", async () => {
+    const res = await app.request("/app/trace/trace_abc/share", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer epk_dash_unknown_key_0000000000",
+        "Content-Type": "application/json",
+      },
+      body: "{}",
+    })
+    expect(res.status).toBe(401)
+  })
+
   test("returns 403 when a different org tries to mint (never 404 — existence leak)", async () => {
     const res = await app.request("/app/trace/trace_abc/share", {
       method: "POST",
-      headers: { "X-Org-Id": "org_competitor", "Content-Type": "application/json" },
+      headers: { ...BEARER_COMP, "Content-Type": "application/json" },
       body: "{}",
     })
     expect(res.status).toBe(403)
@@ -285,7 +306,7 @@ describe("POST /app/trace/:id/share: auth'd mint endpoint", () => {
   test("returns 404 for a trace that doesn't exist", async () => {
     const res = await app.request("/app/trace/trace_nope/share", {
       method: "POST",
-      headers: { "X-Org-Id": "org_acme", "Content-Type": "application/json" },
+      headers: { ...BEARER_ACME, "Content-Type": "application/json" },
       body: "{}",
     })
     expect(res.status).toBe(404)
@@ -294,7 +315,7 @@ describe("POST /app/trace/:id/share: auth'd mint endpoint", () => {
   test("caps expiresInSeconds at MAX_SHARE_TTL_SECONDS (30 days)", async () => {
     const res = await app.request("/app/trace/trace_abc/share", {
       method: "POST",
-      headers: { "X-Org-Id": "org_acme", "Content-Type": "application/json" },
+      headers: { ...BEARER_ACME, "Content-Type": "application/json" },
       body: JSON.stringify({ expiresInSeconds: 99999999 }), // ~3 years, should be capped
     })
     expect(res.status).toBe(201)

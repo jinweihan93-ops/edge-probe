@@ -4,6 +4,7 @@ import { BackendClient } from "./lib/backend.ts"
 import { PublicTracePage } from "./pages/publicTrace.tsx"
 import { PrivateTracePage } from "./pages/privateTrace.tsx"
 import { NotFoundPage } from "./pages/notFound.tsx"
+import { parseOrgBearerMap } from "./lib/bearerMap.ts"
 
 /**
  * EdgeProbe web dashboard.
@@ -20,10 +21,18 @@ import { NotFoundPage } from "./pages/notFound.tsx"
 
 export interface WebDeps {
   backend: BackendClient
+  /**
+   * `orgId → bearer`. In prod this is populated from the user's session
+   * cookie (only one entry, for the signed-in org). In dev the env var
+   * `ORG_BEARERS` lets you configure multiple so `?org=org_foo` flips
+   * between them — but only orgs for which we actually hold a bearer are
+   * reachable. A user can't claim an org they don't have a key for.
+   */
+  orgBearers: Map<string, string>
 }
 
 export function createWebApp(deps: WebDeps) {
-  const { backend } = deps
+  const { backend, orgBearers } = deps
   const app = new Hono()
 
   app.get("/healthz", (c) => c.json({ ok: true }))
@@ -54,19 +63,22 @@ export function createWebApp(deps: WebDeps) {
   /**
    * GET /app/trace/:id — authenticated dashboard detail.
    *
-   * Auth model for Day 1: the browser must send `X-Org-Id` (set by the real
-   * auth shell that will live here later). If absent, we fall back to
-   * `?org=` query param so the dev flow (`open http://localhost:3001/app/trace/xxx?org=org_acme`)
-   * works without cookies.
+   * Auth model: the user's org is looked up in `orgBearers`, which is
+   * populated from the session (prod) or `ORG_BEARERS` env (dev). The
+   * `?org=` query param SELECTS which of the user's orgs to render — it
+   * does NOT grant access. If the caller requests an org they don't have
+   * a bearer for, we return the single not-found page, same as a missing
+   * trace.
    *
    * 401 from the backend → our own "not found"; a stranger probing should
    * not learn that a trace id exists. 403 (wrong org) collapses the same
    * way as per Critical Path #2.
    */
   app.get("/app/trace/:id", async (c) => {
-    const headerOrg = c.req.header("X-Org-Id")
     const queryOrg = c.req.query("org")
-    const orgId = headerOrg ?? queryOrg
+    // Prod TODO: read orgId from the signed-in session cookie instead of
+    // the query string. For now env-driven bearers + ?org= is the dev flow.
+    const orgId = queryOrg ?? (orgBearers.size === 1 ? [...orgBearers.keys()][0] : undefined)
     if (!orgId) {
       return c.html(
         <NotFoundPage reason="This page requires org context. Pass ?org=your_org_id for dev, or sign in." />,
@@ -74,7 +86,14 @@ export function createWebApp(deps: WebDeps) {
       )
     }
 
-    const { status, body } = await backend.fetchPrivate(c.req.param("id"), orgId)
+    const bearer = orgBearers.get(orgId)
+    if (!bearer) {
+      // The caller has no bearer for the requested org. Don't give them a
+      // "login" page that reveals which orgs exist — collapse to 404/401.
+      return c.html(<NotFoundPage />, 401)
+    }
+
+    const { status, body } = await backend.fetchPrivate(c.req.param("id"), bearer)
     if (!body) {
       // 401, 403, 404 — all collapse to the same not-found page for the
       // public-facing guarantee. The status code we return mirrors the backend.
@@ -88,7 +107,8 @@ export function createWebApp(deps: WebDeps) {
 
 export function makeDefaultWebDeps(): WebDeps {
   const baseUrl = process.env.BACKEND_URL ?? "http://127.0.0.1:3000"
-  return { backend: new BackendClient({ baseUrl }) }
+  const orgBearers = parseOrgBearerMap(process.env.ORG_BEARERS)
+  return { backend: new BackendClient({ baseUrl }), orgBearers }
 }
 
 if (import.meta.main) {

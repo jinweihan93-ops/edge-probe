@@ -63,16 +63,21 @@ export class BackendClient {
   }
 
   /**
-   * Hits `/app/trace/:id` with `X-Org-Id` forwarded.
+   * Hits `/app/trace/:id` with the dashboard bearer forwarded.
    * Returns the status and parsed body so the page handler can distinguish
    * 401 / 403 / 404 and render the right thing.
+   *
+   * The bearer — NOT the orgId — is the identity proof. The page handler
+   * resolves the user's requested org to a bearer from its own
+   * `DASHBOARD_KEYS` config; a user who doesn't have a bearer for an org
+   * can't impersonate it just by flipping the URL query param.
    */
   async fetchPrivate(
     id: string,
-    orgId: string,
+    bearer: string,
   ): Promise<{ status: number; body: PrivateTraceResponse | null }> {
     const res = await this.fetchImpl(`${this.baseUrl}/app/trace/${encodeURIComponent(id)}`, {
-      headers: { "X-Org-Id": orgId },
+      headers: { Authorization: `Bearer ${bearer}` },
     })
     if (!res.ok) return { status: res.status, body: null }
     return { status: res.status, body: (await res.json()) as PrivateTraceResponse }

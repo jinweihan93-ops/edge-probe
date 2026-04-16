@@ -10,11 +10,18 @@ import {
   MAX_SHARE_TTL_SECONDS,
   type ShareTokenSigner,
 } from "./shareToken.ts"
+import { getAuthenticatedOrg, parseDashboardKeys, testDashboardKeys } from "./auth.ts"
 
 export interface AppDeps {
   store: SpanStore
   views: SpanViews
   signer: ShareTokenSigner
+  /**
+   * Boot-time map from dashboard bearer key → orgId. The `/app/*` routes
+   * derive the authenticated org from this table; the client cannot
+   * self-assert an org via a header anymore. See `src/auth.ts`.
+   */
+  dashboardKeys: Map<string, string>
 }
 
 /**
@@ -26,7 +33,7 @@ export interface AppDeps {
  * two deployments.
  */
 export function createApp(deps: AppDeps) {
-  const { store, views, signer } = deps
+  const { store, views, signer, dashboardKeys } = deps
   const app = new Hono()
 
   app.get("/healthz", (c) => c.json({ ok: true }))
@@ -64,7 +71,9 @@ export function createApp(deps: AppDeps) {
 
   /**
    * POST /app/trace/:id/share — mint a short-lived signed token for a trace.
-   * Auth: `X-Org-Id` header (stand-in for real session auth).
+   * Auth: `Authorization: Bearer epk_dash_...` — the bearer maps to an orgId
+   * via the boot-time `dashboardKeys` table. The client cannot self-assert
+   * an org; the key IS the identity proof.
    *
    * Only the owning org may mint a share. The returned token encodes
    * (traceId, orgId, expiresAt) and is verified on every /r/:token hit. A
@@ -75,7 +84,7 @@ export function createApp(deps: AppDeps) {
    */
   app.post("/app/trace/:id/share", async (c) => {
     const id = c.req.param("id")
-    const orgId = c.req.header("X-Org-Id")
+    const orgId = getAuthenticatedOrg(c, dashboardKeys)
     if (!orgId) {
       return c.json({ error: "unauthorized" }, 401)
     }
@@ -154,10 +163,11 @@ export function createApp(deps: AppDeps) {
   /**
    * GET /app/trace/:id — authenticated dashboard view. Full content when opted in.
    * Cross-org scan returns 403, not 404 (Critical Path #2 — never leak existence).
+   * Auth: `Authorization: Bearer epk_dash_...` (see auth.ts).
    */
   app.get("/app/trace/:id", async (c) => {
     const id = c.req.param("id")
-    const orgId = c.req.header("X-Org-Id") // stand-in for real session auth
+    const orgId = getAuthenticatedOrg(c, dashboardKeys)
     if (!orgId) {
       return c.json({ error: "unauthorized" }, 401)
     }
@@ -186,12 +196,18 @@ export function createApp(deps: AppDeps) {
  * Test-default deps: in-memory store, deterministic, zero I/O. Stays sync
  * at construction time so tests can do `const deps = makeMemoryDeps(s)`
  * without juggling await in every setup.
+ *
+ * `dashboardKeys` defaults to the test mapping (acme + competitor). Tests
+ * that want to exercise "no valid key" can pass an empty Map.
  */
-export function makeMemoryDeps(shareTokenSecret: string): AppDeps {
+export function makeMemoryDeps(
+  shareTokenSecret: string,
+  dashboardKeys: Map<string, string> = testDashboardKeys(),
+): AppDeps {
   const store = new InMemorySpanStore()
   const views = new SpanViews(store)
   const signer = new HmacShareTokenSigner(shareTokenSecret)
-  return { store, views, signer }
+  return { store, views, signer, dashboardKeys }
 }
 
 /**
@@ -204,6 +220,7 @@ export function makeMemoryDeps(shareTokenSecret: string): AppDeps {
  */
 export async function makeDefaultDeps(config: {
   shareTokenSecret: string
+  dashboardKeys: Map<string, string>
   databaseUrl?: string | undefined
 }): Promise<AppDeps> {
   const signer = new HmacShareTokenSigner(config.shareTokenSecret)
@@ -214,10 +231,10 @@ export async function makeDefaultDeps(config: {
       console.log(`[migrate] applied: ${applied.join(", ")}`)
     }
     const store = new PgSpanStore(sql)
-    return { store, views: new SpanViews(store), signer }
+    return { store, views: new SpanViews(store), signer, dashboardKeys: config.dashboardKeys }
   }
   console.warn("[server] DATABASE_URL not set — using in-memory store (data lost on restart)")
-  return makeMemoryDeps(config.shareTokenSecret)
+  return makeMemoryDeps(config.shareTokenSecret, config.dashboardKeys)
 }
 
 function requireShareSecret(): string {
@@ -231,10 +248,22 @@ function requireShareSecret(): string {
   return s
 }
 
+function requireDashboardKeys(): Map<string, string> {
+  const keys = parseDashboardKeys(process.env.DASHBOARD_KEYS)
+  if (keys.size === 0) {
+    throw new Error(
+      'DASHBOARD_KEYS env var must be a JSON object mapping bearer keys to orgIds. ' +
+        'Example: DASHBOARD_KEYS=\'{"epk_dash_acme_<32-hex>":"org_acme"}\'',
+    )
+  }
+  return keys
+}
+
 // Allow `bun run src/server.ts` to boot the server directly.
 if (import.meta.main) {
   const deps = await makeDefaultDeps({
     shareTokenSecret: requireShareSecret(),
+    dashboardKeys: requireDashboardKeys(),
     databaseUrl: process.env.DATABASE_URL,
   })
   const app = createApp(deps)

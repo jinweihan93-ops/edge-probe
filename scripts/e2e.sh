@@ -38,6 +38,14 @@ WEB_BASE="http://127.0.0.1:$WEB_PORT"
 # ≥32 chars that matches between server and any off-band signing we do.
 export SHARE_TOKEN_SECRET="${SHARE_TOKEN_SECRET:-e2e-test-secret-do-not-use-in-prod-xxxxxxxxxxxxxxxx}"
 
+# Dashboard-key auth. The bearer → orgId mapping is identical to
+# src/auth.ts's TEST_DASHBOARD_KEY_* constants, so the in-tree unit tests
+# and this live-backend smoke exercise the exact same wire shape. Without
+# DASHBOARD_KEYS set the backend now refuses to boot.
+DASH_KEY_ACME="epk_dash_acme_test_0000000000000000"
+DASH_KEY_COMP="epk_dash_comp_test_0000000000000000"
+export DASHBOARD_KEYS='{"'"$DASH_KEY_ACME"'":"org_acme","'"$DASH_KEY_COMP"'":"org_competitor"}'
+
 cd "$BACKEND_DIR"
 
 # ---- start backend ----
@@ -120,12 +128,12 @@ fi
 echo "[e2e]   → 202 accepted"
 
 # ---- 2. Mint a share token ----
-# The owning org (org_acme) POSTs to /app/trace/$TRACE_ID/share and gets back
-# a signed token. Without this step, nobody can turn a trace id into a
-# working /r/:token URL.
+# The owning org (org_acme) POSTs to /app/trace/$TRACE_ID/share with a
+# dashboard bearer and gets back a signed token. Without this step, nobody
+# can turn a trace id into a working /r/:token URL.
 echo "[e2e] POST /app/trace/$TRACE_ID/share"
 SHARE_RESP=$(curl -sS -X POST "$BASE/app/trace/$TRACE_ID/share" \
-  -H "X-Org-Id: org_acme" \
+  -H "Authorization: Bearer $DASH_KEY_ACME" \
   -H "Content-Type: application/json" \
   --data '{}')
 SHARE_TOKEN=$(echo "$SHARE_RESP" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
@@ -160,9 +168,10 @@ if [ "$RAW_STATUS" != "404" ]; then
 fi
 echo "[e2e]   → raw trace id returns 404 ✓"
 
-# ---- 5. GET /app/trace/:id with the right org — content should be present ----
-echo "[e2e] GET /app/trace/$TRACE_ID (correct org)"
-curl -fsS -H "X-Org-Id: org_acme" "$BASE/app/trace/$TRACE_ID" > /tmp/edgeprobe-private.json
+# ---- 5. GET /app/trace/:id with the right org bearer — content present ----
+echo "[e2e] GET /app/trace/$TRACE_ID (correct bearer)"
+curl -fsS -H "Authorization: Bearer $DASH_KEY_ACME" \
+  "$BASE/app/trace/$TRACE_ID" > /tmp/edgeprobe-private.json
 if ! grep -q "SECRET USER PROMPT" /tmp/edgeprobe-private.json; then
   echo "[e2e] FAIL: auth'd JSON is missing opted-in prompt text" >&2
   cat /tmp/edgeprobe-private.json >&2
@@ -170,10 +179,10 @@ if ! grep -q "SECRET USER PROMPT" /tmp/edgeprobe-private.json; then
 fi
 echo "[e2e]   → auth'd JSON contains opted-in content ✓"
 
-# ---- 6. GET /app/trace/:id with the wrong org — must be 403, not 404 ----
-echo "[e2e] GET /app/trace/$TRACE_ID (wrong org)"
+# ---- 6. GET /app/trace/:id with a foreign org's bearer — must be 403 ----
+echo "[e2e] GET /app/trace/$TRACE_ID (wrong bearer)"
 WRONG_STATUS=$(curl -sS -o /dev/null -w "%{http_code}" \
-  -H "X-Org-Id: org_competitor" "$BASE/app/trace/$TRACE_ID")
+  -H "Authorization: Bearer $DASH_KEY_COMP" "$BASE/app/trace/$TRACE_ID")
 if [ "$WRONG_STATUS" != "403" ]; then
   echo "[e2e] FAIL: cross-org scan returned $WRONG_STATUS, expected 403" >&2
   echo "[e2e] A 404 here would leak existence. A 200 would leak content." >&2
@@ -181,10 +190,21 @@ if [ "$WRONG_STATUS" != "403" ]; then
 fi
 echo "[e2e]   → cross-org returns 403 ✓"
 
-# ---- 7. GET /app/trace/unknown_id with any org — must be 404 ----
+# ---- 6b. X-Org-Id header alone — must be 401 (regression guard) ----
+# The old trust-on-first-sight header must never be accepted again.
+echo "[e2e] GET /app/trace/$TRACE_ID with only X-Org-Id (no bearer)"
+HEADER_ONLY_STATUS=$(curl -sS -o /dev/null -w "%{http_code}" \
+  -H "X-Org-Id: org_acme" "$BASE/app/trace/$TRACE_ID")
+if [ "$HEADER_ONLY_STATUS" != "401" ]; then
+  echo "[e2e] FAIL: X-Org-Id-only returned $HEADER_ONLY_STATUS, expected 401 (auth hole regression)" >&2
+  exit 1
+fi
+echo "[e2e]   → bare X-Org-Id ignored, returns 401 ✓"
+
+# ---- 7. GET /app/trace/unknown_id with a valid bearer — must be 404 ----
 echo "[e2e] GET /app/trace/never_existed_$RANDOM"
 NOT_FOUND_STATUS=$(curl -sS -o /dev/null -w "%{http_code}" \
-  -H "X-Org-Id: org_acme" "$BASE/app/trace/never_existed_$RANDOM")
+  -H "Authorization: Bearer $DASH_KEY_ACME" "$BASE/app/trace/never_existed_$RANDOM")
 if [ "$NOT_FOUND_STATUS" != "404" ]; then
   echo "[e2e] FAIL: missing trace returned $NOT_FOUND_STATUS, expected 404" >&2
   exit 1
@@ -199,7 +219,11 @@ echo "[e2e]   → missing trace returns 404 ✓"
 echo
 echo "[e2e] starting web dashboard on :$WEB_PORT (backend=$BASE)"
 cd "$WEB_DIR"
-PORT="$WEB_PORT" BACKEND_URL="$BASE" \
+# ORG_BEARERS is what the web process uses to resolve ?org=foo → bearer.
+# Without this the web side of the e2e sees every /app/trace/:id as
+# "no bearer for this org" and returns 401.
+ORG_BEARERS_JSON='{"org_acme":"'"$DASH_KEY_ACME"'","org_competitor":"'"$DASH_KEY_COMP"'"}'
+PORT="$WEB_PORT" BACKEND_URL="$BASE" ORG_BEARERS="$ORG_BEARERS_JSON" \
   bun run start >/tmp/edgeprobe-e2e-web.log 2>&1 &
 WEB_PID=$!
 
