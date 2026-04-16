@@ -1,17 +1,25 @@
 import { Hono } from "hono"
 import { InMemorySpanStore, SpanViews, type Trace, type StoredSpan } from "./views.ts"
+import {
+  HmacShareTokenSigner,
+  InvalidShareTokenError,
+  DEFAULT_SHARE_TTL_SECONDS,
+  MAX_SHARE_TTL_SECONDS,
+  type ShareTokenSigner,
+} from "./shareToken.ts"
 
 export interface AppDeps {
   store: InMemorySpanStore
   views: SpanViews
+  signer: ShareTokenSigner
 }
 
 /**
  * Build a Hono app. Factored this way so tests can construct an isolated
- * instance without shared state.
+ * instance without shared state (and inject a test-only signer).
  */
-export function createApp(deps: AppDeps = makeDefaultDeps()) {
-  const { store, views } = deps
+export function createApp(deps: AppDeps = makeDefaultDeps({ shareTokenSecret: requireShareSecret() })) {
+  const { store, views, signer } = deps
   const app = new Hono()
 
   app.get("/healthz", (c) => c.json({ ok: true }))
@@ -48,18 +56,82 @@ export function createApp(deps: AppDeps = makeDefaultDeps()) {
   })
 
   /**
+   * POST /app/trace/:id/share — mint a short-lived signed token for a trace.
+   * Auth: `X-Org-Id` header (stand-in for real session auth).
+   *
+   * Only the owning org may mint a share. The returned token encodes
+   * (traceId, orgId, expiresAt) and is verified on every /r/:token hit. A
+   * user who already knows a raw trace id can NOT turn it into a working
+   * public link without hitting this endpoint authenticated.
+   *
+   * Body (optional): `{ expiresInSeconds?: number }`. Default 7 days, capped 30.
+   */
+  app.post("/app/trace/:id/share", async (c) => {
+    const id = c.req.param("id")
+    const orgId = c.req.header("X-Org-Id")
+    if (!orgId) {
+      return c.json({ error: "unauthorized" }, 401)
+    }
+
+    const trace = store.getTrace(id)
+    if (!trace) {
+      return c.json({ error: "not found" }, 404)
+    }
+    if (trace.orgId !== orgId) {
+      // 403, not 404: Critical Path #2 — never leak existence across orgs.
+      return c.json({ error: "forbidden" }, 403)
+    }
+
+    let expiresInSeconds = DEFAULT_SHARE_TTL_SECONDS
+    try {
+      const body = (await c.req.json().catch(() => ({}))) as { expiresInSeconds?: number }
+      if (typeof body.expiresInSeconds === "number" && body.expiresInSeconds > 0) {
+        expiresInSeconds = Math.min(body.expiresInSeconds, MAX_SHARE_TTL_SECONDS)
+      }
+    } catch {
+      // Empty/invalid body is fine; use default.
+    }
+    const expiresAt = Math.floor(Date.now() / 1000) + expiresInSeconds
+    const token = signer.sign({ traceId: id, orgId, expiresAt })
+
+    return c.json(
+      {
+        token,
+        url: `/r/${token}`,
+        expiresAt,
+      },
+      201,
+    )
+  })
+
+  /**
    * GET /r/:token — public share URL. Queries ONLY the public view.
    * Critical Path #1: never renders prompt/completion text.
-   * Critical Path #3: per-call opt-in on the SDK does not escalate to here.
+   * Critical Path #3: per-call SDK opt-in does not escalate to here.
+   *
+   * Every failure mode collapses to 404. A stranger probing the endpoint
+   * cannot tell whether a token is malformed, expired, tampered, points at
+   * a trace that doesn't exist, or points at a sensitive trace. They all
+   * look identical from the outside. This is deliberate.
    */
   app.get("/r/:token", (c) => {
     const token = c.req.param("token")
-    // Day 1: token IS the trace id (we'll add real share_tokens table in month 13).
-    const spans = views.public_forTrace(token)
-    const trace = store.getTrace(token)
-    if (!trace || trace.sensitive) {
+    let payload
+    try {
+      payload = signer.verify(token)
+    } catch (err) {
+      if (err instanceof InvalidShareTokenError) {
+        return c.json({ error: "not found" }, 404)
+      }
+      throw err
+    }
+
+    const trace = store.getTrace(payload.traceId)
+    if (!trace || trace.sensitive || trace.orgId !== payload.orgId) {
       return c.json({ error: "not found" }, 404)
     }
+
+    const spans = views.public_forTrace(trace.id)
     return c.json({
       trace: {
         id: trace.id,
@@ -103,10 +175,22 @@ export function createApp(deps: AppDeps = makeDefaultDeps()) {
   return app
 }
 
-export function makeDefaultDeps(): AppDeps {
+export function makeDefaultDeps(config: { shareTokenSecret: string }): AppDeps {
   const store = new InMemorySpanStore()
   const views = new SpanViews(store)
-  return { store, views }
+  const signer = new HmacShareTokenSigner(config.shareTokenSecret)
+  return { store, views, signer }
+}
+
+function requireShareSecret(): string {
+  const s = process.env.SHARE_TOKEN_SECRET
+  if (!s || s.length < 32) {
+    throw new Error(
+      "SHARE_TOKEN_SECRET env var must be set to a string of at least 32 characters. " +
+        "Generate one with: openssl rand -hex 32",
+    )
+  }
+  return s
 }
 
 // Allow `bun run src/server.ts` to boot the server directly.

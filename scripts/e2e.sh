@@ -3,9 +3,12 @@
 #
 # 1. Start the Bun backend on a random port
 # 2. POST an IngestPayload shaped like the one EdgeProbe.trace() emits
-# 3. GET /r/:traceId and assert no prompt/completion text in the public JSON
-# 4. GET /app/trace/:id with the right org and assert we DO see content
-# 5. GET /app/trace/:id with a different org and assert 403 (not 404)
+# 3. POST /app/trace/:id/share to mint a signed share token
+# 4. GET /r/<token> and assert no prompt/completion text in the public JSON
+# 5. GET /r/<raw-traceId> returns 404 — raw ids cannot be used as tokens
+# 6. GET /app/trace/:id with the right org and assert we DO see content
+# 7. GET /app/trace/:id with a different org and assert 403 (not 404)
+# 8. GET /app/trace/:id with an unknown id and assert 404
 #
 # This script is the cold-start contract check. The Swift unit tests in
 # ios/Tests use URLProtocol mocks; this one talks to the real server.
@@ -19,11 +22,17 @@ BACKEND_DIR="$REPO_ROOT/backend"
 PORT="${PORT:-38271}"
 BASE="http://127.0.0.1:$PORT"
 
+# The backend refuses to boot without this. In prod it must be a real random
+# secret (`openssl rand -hex 32`). For the e2e smoke we just need something
+# ≥32 chars that matches between server and any off-band signing we do.
+export SHARE_TOKEN_SECRET="${SHARE_TOKEN_SECRET:-e2e-test-secret-do-not-use-in-prod-xxxxxxxxxxxxxxxx}"
+
 cd "$BACKEND_DIR"
 
 # ---- start backend ----
 echo "[e2e] starting backend on :$PORT"
-PORT="$PORT" bun run start >/tmp/edgeprobe-e2e-server.log 2>&1 &
+PORT="$PORT" SHARE_TOKEN_SECRET="$SHARE_TOKEN_SECRET" \
+  bun run start >/tmp/edgeprobe-e2e-server.log 2>&1 &
 SERVER_PID=$!
 trap 'echo "[e2e] killing backend ($SERVER_PID)"; kill "$SERVER_PID" 2>/dev/null || true' EXIT
 
@@ -90,9 +99,25 @@ if [ "$INGEST_STATUS" != "202" ]; then
 fi
 echo "[e2e]   → 202 accepted"
 
-# ---- 2. GET /r/:token (public) — must not contain the secret strings ----
-echo "[e2e] GET /r/$TRACE_ID"
-curl -fsS "$BASE/r/$TRACE_ID" > /tmp/edgeprobe-public.json
+# ---- 2. Mint a share token ----
+# The owning org (org_acme) POSTs to /app/trace/$TRACE_ID/share and gets back
+# a signed token. Without this step, nobody can turn a trace id into a
+# working /r/:token URL.
+echo "[e2e] POST /app/trace/$TRACE_ID/share"
+SHARE_RESP=$(curl -sS -X POST "$BASE/app/trace/$TRACE_ID/share" \
+  -H "X-Org-Id: org_acme" \
+  -H "Content-Type: application/json" \
+  --data '{}')
+SHARE_TOKEN=$(echo "$SHARE_RESP" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+if [ -z "$SHARE_TOKEN" ]; then
+  echo "[e2e] FAIL: could not parse token from share response: $SHARE_RESP" >&2
+  exit 1
+fi
+echo "[e2e]   → token minted (length=${#SHARE_TOKEN})"
+
+# ---- 3. GET /r/<token> — public, must not contain the secret strings ----
+echo "[e2e] GET /r/<token>"
+curl -fsS "$BASE/r/$SHARE_TOKEN" > /tmp/edgeprobe-public.json
 if grep -q "SECRET USER PROMPT" /tmp/edgeprobe-public.json; then
   echo "[e2e] FAIL: public JSON contains prompt text — PII BOUNDARY BREACH" >&2
   cat /tmp/edgeprobe-public.json >&2
@@ -105,7 +130,17 @@ if grep -q "SECRET COMPLETION" /tmp/edgeprobe-public.json; then
 fi
 echo "[e2e]   → public JSON has no prompt/completion text ✓"
 
-# ---- 3. GET /app/trace/:id with the right org — content should be present ----
+# ---- 4. GET /r/<raw-traceId> must return 404 — raw ids are not tokens ----
+echo "[e2e] GET /r/$TRACE_ID (raw trace id, not a token)"
+RAW_STATUS=$(curl -sS -o /dev/null -w "%{http_code}" "$BASE/r/$TRACE_ID")
+if [ "$RAW_STATUS" != "404" ]; then
+  echo "[e2e] FAIL: raw trace id returned $RAW_STATUS, expected 404" >&2
+  echo "[e2e] This means /r/:token is accepting unsigned input — SHARE TOKEN BYPASS" >&2
+  exit 1
+fi
+echo "[e2e]   → raw trace id returns 404 ✓"
+
+# ---- 5. GET /app/trace/:id with the right org — content should be present ----
 echo "[e2e] GET /app/trace/$TRACE_ID (correct org)"
 curl -fsS -H "X-Org-Id: org_acme" "$BASE/app/trace/$TRACE_ID" > /tmp/edgeprobe-private.json
 if ! grep -q "SECRET USER PROMPT" /tmp/edgeprobe-private.json; then
@@ -115,7 +150,7 @@ if ! grep -q "SECRET USER PROMPT" /tmp/edgeprobe-private.json; then
 fi
 echo "[e2e]   → auth'd JSON contains opted-in content ✓"
 
-# ---- 4. GET /app/trace/:id with the wrong org — must be 403, not 404 ----
+# ---- 6. GET /app/trace/:id with the wrong org — must be 403, not 404 ----
 echo "[e2e] GET /app/trace/$TRACE_ID (wrong org)"
 WRONG_STATUS=$(curl -sS -o /dev/null -w "%{http_code}" \
   -H "X-Org-Id: org_competitor" "$BASE/app/trace/$TRACE_ID")
@@ -126,7 +161,7 @@ if [ "$WRONG_STATUS" != "403" ]; then
 fi
 echo "[e2e]   → cross-org returns 403 ✓"
 
-# ---- 5. GET /app/trace/unknown_id with any org — must be 404 ----
+# ---- 7. GET /app/trace/unknown_id with any org — must be 404 ----
 echo "[e2e] GET /app/trace/never_existed_$RANDOM"
 NOT_FOUND_STATUS=$(curl -sS -o /dev/null -w "%{http_code}" \
   -H "X-Org-Id: org_acme" "$BASE/app/trace/never_existed_$RANDOM")
@@ -137,4 +172,4 @@ fi
 echo "[e2e]   → missing trace returns 404 ✓"
 
 echo
-echo "[e2e] ALL CHECKS PASSED — SDK↔backend contract holds, PII boundary enforced"
+echo "[e2e] ALL CHECKS PASSED — SDK↔backend contract holds, PII boundary enforced, share tokens required"

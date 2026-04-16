@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach } from "bun:test"
-import { createApp, makeDefaultDeps } from "../src/server.ts"
+import { createApp, makeDefaultDeps, type AppDeps } from "../src/server.ts"
 import type { StoredSpan, Trace } from "../src/views.ts"
 
 /**
@@ -9,7 +9,13 @@ import type { StoredSpan, Trace } from "../src/views.ts"
  * If any of these fail, EdgeProbe leaks user prompts. The product is dead.
  */
 
-function seedTraceWithContent(deps: ReturnType<typeof makeDefaultDeps>) {
+const TEST_SHARE_SECRET = "x".repeat(48)
+
+function freshDeps(): AppDeps {
+  return makeDefaultDeps({ shareTokenSecret: TEST_SHARE_SECRET })
+}
+
+function seedTraceWithContent(deps: AppDeps) {
   const trace: Trace = {
     id: "trace_abc",
     orgId: "org_acme",
@@ -49,18 +55,28 @@ function seedTraceWithContent(deps: ReturnType<typeof makeDefaultDeps>) {
   return { trace, promptSpan }
 }
 
+/** Mint a valid share token for the seeded trace directly via the signer. */
+function mintToken(deps: AppDeps, traceId = "trace_abc", orgId = "org_acme") {
+  return deps.signer.sign({
+    traceId,
+    orgId,
+    expiresAt: Math.floor(Date.now() / 1000) + 3600,
+  })
+}
+
 describe("Critical Path #1: public share never renders prompt/completion text", () => {
   let app: ReturnType<typeof createApp>
-  let deps: ReturnType<typeof makeDefaultDeps>
+  let deps: AppDeps
 
   beforeEach(() => {
-    deps = makeDefaultDeps()
+    deps = freshDeps()
     app = createApp(deps)
     seedTraceWithContent(deps)
   })
 
   test("GET /r/:token response JSON contains no content fields", async () => {
-    const res = await app.request("/r/trace_abc")
+    const token = mintToken(deps)
+    const res = await app.request(`/r/${token}`)
     expect(res.status).toBe(200)
     const body = (await res.json()) as { spans: unknown[] }
     const raw = JSON.stringify(body)
@@ -80,7 +96,8 @@ describe("Critical Path #1: public share never renders prompt/completion text", 
   })
 
   test("GET /r/:token strips content-keyed attributes even if stored", async () => {
-    const res = await app.request("/r/trace_abc")
+    const token = mintToken(deps)
+    const res = await app.request(`/r/${token}`)
     const body = (await res.json()) as { spans: Array<{ attributes: Record<string, unknown> }> }
     for (const span of body.spans) {
       expect(span.attributes).not.toHaveProperty("gen_ai.prompt")
@@ -103,18 +120,20 @@ describe("Critical Path #1: public share never renders prompt/completion text", 
       attributes: {},
       sensitive: true,
     })
-    const res = await app.request("/r/trace_sensitive")
+    const token = mintToken(deps, "trace_sensitive", "org_acme")
+    const res = await app.request(`/r/${token}`)
     expect(res.status).toBe(404)
   })
 })
 
 describe("Critical Path #3: per-call includeContent:true does not escalate public visibility", () => {
   test("even with includeContent:true, public view hides content", async () => {
-    const deps = makeDefaultDeps()
+    const deps = freshDeps()
     const app = createApp(deps)
     seedTraceWithContent(deps) // stored span has includeContent: true and text fields populated
 
-    const pub = await (await app.request("/r/trace_abc")).json()
+    const token = mintToken(deps)
+    const pub = await (await app.request(`/r/${token}`)).json()
     const raw = JSON.stringify(pub)
     expect(raw).not.toContain("SECRET USER PROMPT")
 
@@ -130,7 +149,7 @@ describe("Critical Path #3: per-call includeContent:true does not escalate publi
 
 describe("Critical Path #2: cross-org access returns 403, not 404", () => {
   test("auth'd requester from another org gets 403 (not 404 — never leak existence)", async () => {
-    const deps = makeDefaultDeps()
+    const deps = freshDeps()
     const app = createApp(deps)
     seedTraceWithContent(deps) // stored under org_acme
 
@@ -150,7 +169,7 @@ describe("Critical Path #2: cross-org access returns 403, not 404", () => {
   })
 
   test("unauthenticated request returns 401", async () => {
-    const deps = makeDefaultDeps()
+    const deps = freshDeps()
     const app = createApp(deps)
     seedTraceWithContent(deps)
 
@@ -159,9 +178,135 @@ describe("Critical Path #2: cross-org access returns 403, not 404", () => {
   })
 })
 
+describe("Share tokens: /r/:token must be unforgeable, raw trace-ids do not work", () => {
+  let deps: AppDeps
+  let app: ReturnType<typeof createApp>
+
+  beforeEach(() => {
+    deps = freshDeps()
+    app = createApp(deps)
+    seedTraceWithContent(deps)
+  })
+
+  test("GET /r/<raw-traceId> returns 404 — not a token", async () => {
+    // Before share tokens existed this worked. It must not anymore.
+    const res = await app.request("/r/trace_abc")
+    expect(res.status).toBe(404)
+  })
+
+  test("GET /r/<tampered-token> returns 404", async () => {
+    const token = mintToken(deps)
+    // Flip one character in the body half.
+    const [body, sig] = token.split(".")
+    const tampered = `${body.slice(0, -1)}${body.endsWith("a") ? "b" : "a"}.${sig}`
+    const res = await app.request(`/r/${tampered}`)
+    expect(res.status).toBe(404)
+  })
+
+  test("GET /r/<expired-token> returns 404", async () => {
+    const expired = deps.signer.sign({
+      traceId: "trace_abc",
+      orgId: "org_acme",
+      expiresAt: Math.floor(Date.now() / 1000) - 10,
+    })
+    const res = await app.request(`/r/${expired}`)
+    expect(res.status).toBe(404)
+  })
+
+  test("GET /r/<token-for-nonexistent-trace> returns 404", async () => {
+    const token = deps.signer.sign({
+      traceId: "trace_never_existed",
+      orgId: "org_acme",
+      expiresAt: Math.floor(Date.now() / 1000) + 3600,
+    })
+    const res = await app.request(`/r/${token}`)
+    expect(res.status).toBe(404)
+  })
+
+  test("GET /r/<token-with-wrong-org> returns 404 (defense in depth)", async () => {
+    // Someone mints a token claiming the trace belongs to their org.
+    // The server must re-check trace.orgId against payload.orgId.
+    const sneaky = deps.signer.sign({
+      traceId: "trace_abc",
+      orgId: "org_attacker",
+      expiresAt: Math.floor(Date.now() / 1000) + 3600,
+    })
+    const res = await app.request(`/r/${sneaky}`)
+    expect(res.status).toBe(404)
+  })
+})
+
+describe("POST /app/trace/:id/share: auth'd mint endpoint", () => {
+  let deps: AppDeps
+  let app: ReturnType<typeof createApp>
+
+  beforeEach(() => {
+    deps = freshDeps()
+    app = createApp(deps)
+    seedTraceWithContent(deps)
+  })
+
+  test("returns 201 with { token, url, expiresAt } for the owning org", async () => {
+    const res = await app.request("/app/trace/trace_abc/share", {
+      method: "POST",
+      headers: { "X-Org-Id": "org_acme", "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    })
+    expect(res.status).toBe(201)
+    const body = (await res.json()) as { token: string; url: string; expiresAt: number }
+    expect(typeof body.token).toBe("string")
+    expect(body.token.split(".").length).toBe(2)
+    expect(body.url).toBe(`/r/${body.token}`)
+    expect(body.expiresAt).toBeGreaterThan(Math.floor(Date.now() / 1000))
+
+    // The minted token actually works against /r/:token.
+    const pub = await app.request(body.url)
+    expect(pub.status).toBe(200)
+  })
+
+  test("returns 401 without X-Org-Id", async () => {
+    const res = await app.request("/app/trace/trace_abc/share", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    })
+    expect(res.status).toBe(401)
+  })
+
+  test("returns 403 when a different org tries to mint (never 404 — existence leak)", async () => {
+    const res = await app.request("/app/trace/trace_abc/share", {
+      method: "POST",
+      headers: { "X-Org-Id": "org_competitor", "Content-Type": "application/json" },
+      body: "{}",
+    })
+    expect(res.status).toBe(403)
+  })
+
+  test("returns 404 for a trace that doesn't exist", async () => {
+    const res = await app.request("/app/trace/trace_nope/share", {
+      method: "POST",
+      headers: { "X-Org-Id": "org_acme", "Content-Type": "application/json" },
+      body: "{}",
+    })
+    expect(res.status).toBe(404)
+  })
+
+  test("caps expiresInSeconds at MAX_SHARE_TTL_SECONDS (30 days)", async () => {
+    const res = await app.request("/app/trace/trace_abc/share", {
+      method: "POST",
+      headers: { "X-Org-Id": "org_acme", "Content-Type": "application/json" },
+      body: JSON.stringify({ expiresInSeconds: 99999999 }), // ~3 years, should be capped
+    })
+    expect(res.status).toBe(201)
+    const body = (await res.json()) as { expiresAt: number }
+    const maxReasonable = Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 30 + 5
+    expect(body.expiresAt).toBeLessThanOrEqual(maxReasonable)
+  })
+})
+
 describe("POST /ingest smoke", () => {
   test("accepts valid trace+spans with Bearer epk_pub_ key", async () => {
-    const app = createApp()
+    const app = createApp(freshDeps())
     const payload = {
       trace: {
         id: "trace_e2e",
@@ -188,7 +333,7 @@ describe("POST /ingest smoke", () => {
   })
 
   test("rejects missing auth header with 401", async () => {
-    const app = createApp()
+    const app = createApp(freshDeps())
     const res = await app.request("/ingest", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -198,7 +343,7 @@ describe("POST /ingest smoke", () => {
   })
 
   test("rejects non-public key prefix with 401", async () => {
-    const app = createApp()
+    const app = createApp(freshDeps())
     const res = await app.request("/ingest", {
       method: "POST",
       headers: {
@@ -211,7 +356,7 @@ describe("POST /ingest smoke", () => {
   })
 
   test("rejects malformed payload with 400", async () => {
-    const app = createApp()
+    const app = createApp(freshDeps())
     const res = await app.request("/ingest", {
       method: "POST",
       headers: {
