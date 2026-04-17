@@ -1,0 +1,1 @@
+Explain how an LSM-tree database handles write amplification, in two sentences.

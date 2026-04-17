@@ -1,0 +1,36 @@
+{
+  "iterations" : 3,
+  "model" : "mock-v1",
+  "promptBytes" : 79,
+  "promptHash" : "d5c4d7725bd06732",
+  "runs" : [
+    {
+      "decodeMs" : 1500,
+      "decodeTokensPerSec" : 36,
+      "iter" : 0,
+      "outputTokenHash" : "aaaaaaaaaaaaaaaa",
+      "prefillMs" : 620,
+      "tokensGenerated" : 54,
+      "totalMs" : 2120
+    },
+    {
+      "decodeMs" : 1440,
+      "decodeTokensPerSec" : 35,
+      "iter" : 1,
+      "outputTokenHash" : "bbbbbbbbbbbbbbbb",
+      "prefillMs" : 610,
+      "tokensGenerated" : 50,
+      "totalMs" : 2050
+    },
+    {
+      "decodeMs" : 1680,
+      "decodeTokensPerSec" : 34,
+      "iter" : 2,
+      "outputTokenHash" : "cccccccccccccccc",
+      "prefillMs" : 620,
+      "tokensGenerated" : 58,
+      "totalMs" : 2300
+    }
+  ],
+  "schema" : 1
+}

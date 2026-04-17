@@ -194,6 +194,53 @@ jobs:
       - name: Run CriticalPathsTests only
         run: swift test --filter CriticalPathsTests
 
+  # Benchmark harness (Slice 9). Own job so a format drift in the goldens
+  # surfaces as a discrete red signal rather than getting buried in the main
+  # iOS suite. Depends on ../ios via a local path dep — so the iOS source
+  # still has to be present, but we run `swift test` scoped to the harness
+  # package only.
+  harness:
+    name: Harness — swift test (run + diff goldens)
+    runs-on: macos-14
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: harness
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.0.app
+      - name: Cache SwiftPM artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            harness/.build
+            ~/Library/Caches/org.swift.swiftpm
+          key: swiftpm-harness-${{ runner.os }}-${{ hashFiles('harness/Package.swift','ios/Package.swift') }}
+          restore-keys: |
+            swiftpm-harness-${{ runner.os }}-
+      - name: Build harness executable
+        run: swift build
+      - name: Smoke-run the CLI on a committed prompt fixture
+        # The contract from docs/SLICES.md §Slice 9 "Done" — this exact
+        # invocation must produce a JSON timing blob. We parse with Ruby
+        # (pre-installed on macos-14 runners) rather than bun/jq so the
+        # job has zero setup deps beyond Xcode.
+        run: |
+          swift run harness run \
+            --model mock-v1 \
+            --prompt Tests/harnessTests/Fixtures/prompts/cap.txt \
+            --iters 2 | tee /tmp/harness-smoke.json
+          # Output must parse as JSON with non-empty runs[].
+          ruby -rjson -e '
+            b = JSON.parse(File.read("/tmp/harness-smoke.json"))
+            raise "runs[] missing or empty" unless b["runs"].is_a?(Array) && !b["runs"].empty?
+            raise "schema field missing" unless b["schema"]
+            puts "harness smoke OK — #{b["runs"].length} iterations, schema v#{b["schema"]}"
+          '
+      - name: Run harness test suite
+        run: swift test
+
   e2e:
     name: End-to-end — scripts/e2e.sh
     runs-on: ubuntu-latest
@@ -233,12 +280,13 @@ jobs:
       - e2e
       - critical-paths-backend
       - critical-paths-ios
+      - harness
     if: always()
     steps:
       - name: Verify required jobs succeeded
         run: |
           failed=0
-          for job in ios backend web action e2e critical-paths-backend critical-paths-ios; do
+          for job in ios backend web action e2e critical-paths-backend critical-paths-ios harness; do
             case "$job" in
               ios)                     result="${{ needs.ios.result }}" ;;
               backend)                 result="${{ needs.backend.result }}" ;;
@@ -247,6 +295,7 @@ jobs:
               e2e)                     result="${{ needs.e2e.result }}" ;;
               critical-paths-backend)  result="${{ needs['critical-paths-backend'].result }}" ;;
               critical-paths-ios)      result="${{ needs['critical-paths-ios'].result }}" ;;
+              harness)                 result="${{ needs.harness.result }}" ;;
             esac
             echo "  $job: $result"
             if [ "$result" != "success" ]; then failed=1; fi

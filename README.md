@@ -10,6 +10,7 @@ On-device AI observability for iOS. OpenTelemetry-compatible SDK, trace viewer, 
 ios/       Swift Package — EdgeProbe SDK (iOS 16+)
 backend/   Bun + Postgres — /ingest, /r/{token}, /app/trace/{id}
 web/       Dashboard — /app
+harness/   Benchmark CLI — `harness run` / `harness diff` (Y1 OSS tool)
 docs/      Plan, design system, architecture notes
 scripts/   Dev + CI helpers
 .github/   Workflows (XCFramework builds on llama.cpp tags, CI matrix)
@@ -56,6 +57,38 @@ That is the whole pitch. The SDK captures the span, exports it to the backend, a
 4. Main thread never blocked by SDK
 5. SDK drops oldest on buffer overflow, counter emitted as metric
 6. `EdgeProbe.start()` is idempotent
+
+## Benchmark harness (`harness/`)
+
+Separate SwiftPM package with a `harness` executable + `harness run` / `harness
+diff` subcommands. Purpose per `docs/PLAN.md`: source-of-truth for the monthly
+benchmark posts (Y1 content) AND a reusable integration smoke for the SDK
+(Y2 SDK). Each iteration wraps its work in `EdgeProbe.beginTrace()` in
+dry-run mode, so the harness doubles as a span-pipeline exerciser.
+
+```bash
+cd harness
+
+# Run N iterations against a prompt fixture. Model IDs that don't match a
+# real model loader fall through to a deterministic synthetic path —
+# xorshift32 seeded by SHA(prompt) ⊕ modelId ⊕ iter — so goldens are
+# reproducible across machines and CI runs.
+swift run harness run \
+  --model mock-v1 \
+  --prompt Tests/harnessTests/Fixtures/prompts/cap.txt \
+  --iters 2
+
+# Compare two runs — PR-comment-shaped Markdown diff.
+swift run harness diff baseline.json this.json --threshold 0.15
+
+# Test suite (golden fixtures, error-path coverage, EdgeProbe smoke):
+swift test
+```
+
+The output JSON schema (`TimingBlob`) is versioned. Schema changes MUST
+bump `schema: 1` in `Sources/harness/TimingBlob.swift` so downstream
+consumers — the GitHub Action's diff comment, external benchmark
+dashboards — detect format drift before they render bad numbers.
 
 ## XCFramework builds (llama.cpp / whisper.cpp)
 
