@@ -1,0 +1,18 @@
+{
+  "project": "voiceprobe-demo",
+  "label": "iPhone 15 Pro · iOS 18.2 · Whisper-tiny + llama-3B Q4_K_M",
+  "headlineMetric": "TTFT",
+  "headlineMs": 1280,
+  "totalMs": 4500,
+  "turns": [
+    { "turn": 1, "stages": { "whisper": 240, "prefill": 420, "decode": 620 }, "totalMs": 1280 },
+    { "turn": 2, "stages": { "whisper": 260, "prefill": 480, "decode": 700 }, "totalMs": 1440 },
+    { "turn": 3, "stages": { "whisper": 240, "prefill": 520, "decode": 1020 }, "totalMs": 1780 }
+  ],
+  "git": {
+    "baselineRef": "main",
+    "baselineSha": "abc1234",
+    "thisRef": "perf/voice-probe-slow",
+    "thisSha": "def5678"
+  }
+}

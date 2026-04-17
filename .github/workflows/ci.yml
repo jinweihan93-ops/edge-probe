@@ -98,6 +98,47 @@ jobs:
       - name: Test
         run: bun test
 
+  action:
+    name: Action — bun test + typecheck + golden fixtures
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The Action's smoke test imports from ../backend/src, so a fresh checkout
+    # carries both packages. Its own tests are self-contained (in-memory
+    # backend, no network), so we don't need a live Postgres.
+    defaults:
+      run:
+        working-directory: action
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install action deps
+        run: bun install --frozen-lockfile
+
+      - name: Install backend deps (required by smoke.test.ts cross-package import)
+        working-directory: backend
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Test
+        run: bun test
+
+      - name: Self-invoke on fixture (dry-run, verifies action.yml wiring)
+        run: |
+          bun run src/entry.ts \
+            --trace fixtures/trace.sample.json \
+            --baseline fixtures/baseline.sample.json \
+            --threshold 0.15 \
+            --fail-on-regression false \
+            --org org_acme --project proj_ci \
+            --dry-run
+
   e2e:
     name: End-to-end — scripts/e2e.sh
     runs-on: ubuntu-latest
@@ -129,18 +170,18 @@ jobs:
   required:
     name: All checks
     runs-on: ubuntu-latest
-    needs: [ios, backend, web, e2e]
+    needs: [ios, backend, web, action, e2e]
     if: always()
     steps:
       - name: Verify required jobs succeeded
         run: |
           failed=0
-          for job in ios backend web e2e; do
-            result_var="${job}_result"
+          for job in ios backend web action e2e; do
             case "$job" in
               ios)     result="${{ needs.ios.result }}" ;;
               backend) result="${{ needs.backend.result }}" ;;
               web)     result="${{ needs.web.result }}" ;;
+              action)  result="${{ needs.action.result }}" ;;
               e2e)     result="${{ needs.e2e.result }}" ;;
             esac
             echo "  $job: $result"

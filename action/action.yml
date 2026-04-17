@@ -1,0 +1,103 @@
+name: EdgeProbe
+description: Post a PR comment summarizing an EdgeProbe trace and flag performance regressions against a baseline.
+author: EdgeProbe
+branding:
+  icon: activity
+  color: purple
+
+inputs:
+  trace-file:
+    description: Path to the trace-summary JSON produced by your test harness. Required.
+    required: true
+  baseline-file:
+    description: Optional path to a baseline trace summary. When omitted, the comment renders the informational "first-run" variant and no regression check runs.
+    required: false
+    default: ""
+  threshold:
+    description: Regression threshold on the headline metric, as a proportion (0.15 = 15%).
+    required: false
+    default: "0.15"
+  fail-on-regression:
+    description: Fail the job (exit 1) when a regression is detected. Set to "false" to always pass and leave gating to the consumer.
+    required: false
+    default: "true"
+  backend-url:
+    description: EdgeProbe backend base URL (e.g. https://edgeprobe.dev). Optional — when unset, the Action skips the share-link mint and the comment carries only local numbers.
+    required: false
+    default: ""
+  ingest-key:
+    description: Ingest key (epk_pub_…). Required together with `backend-url` and `dashboard-key` to mint a share link.
+    required: false
+    default: ""
+  dashboard-key:
+    description: Dashboard key (epk_dash_…). Required together with `backend-url` and `ingest-key`.
+    required: false
+    default: ""
+  org-id:
+    description: EdgeProbe org id the trace is ingested under.
+    required: false
+    default: "org_unknown"
+  project-id:
+    description: EdgeProbe project id the trace is ingested under.
+    required: false
+    default: "proj_unknown"
+  dry-run:
+    description: Render the comment to stdout + outputs but do NOT hit the backend. Useful for local testing and for jobs that post via a third-party commenter.
+    required: false
+    default: "false"
+  configure-url:
+    description: Optional "configure" link shown in the footer, e.g. https://edgeprobe.dev/app/projects/<id>.
+    required: false
+    default: ""
+  version:
+    description: Version string shown in the footer. Defaults to the released Action version.
+    required: false
+    default: "0.0.1"
+
+outputs:
+  comment:
+    description: Rendered PR-comment markdown. Pipe into a sticky-comment action (e.g. `marocchino/sticky-pull-request-comment`) to post on the PR.
+    value: ${{ steps.run.outputs.comment }}
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Bun
+      uses: oven-sh/setup-bun@v2
+      with:
+        bun-version: latest
+
+    - name: Run EdgeProbe action
+      id: run
+      shell: bash
+      env:
+        INPUT_TRACE_FILE: ${{ inputs.trace-file }}
+        INPUT_BASELINE_FILE: ${{ inputs.baseline-file }}
+        INPUT_THRESHOLD: ${{ inputs.threshold }}
+        INPUT_FAIL_ON_REGRESSION: ${{ inputs.fail-on-regression }}
+        INPUT_BACKEND_URL: ${{ inputs.backend-url }}
+        INPUT_INGEST_KEY: ${{ inputs.ingest-key }}
+        INPUT_DASHBOARD_KEY: ${{ inputs.dashboard-key }}
+        INPUT_ORG_ID: ${{ inputs.org-id }}
+        INPUT_PROJECT_ID: ${{ inputs.project-id }}
+        INPUT_DRY_RUN: ${{ inputs.dry-run }}
+        INPUT_CONFIGURE_URL: ${{ inputs.configure-url }}
+        INPUT_VERSION: ${{ inputs.version }}
+        EDGEPROBE_ACTION_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        args=(--trace "$INPUT_TRACE_FILE"
+              --threshold "$INPUT_THRESHOLD"
+              --fail-on-regression "$INPUT_FAIL_ON_REGRESSION"
+              --org "$INPUT_ORG_ID"
+              --project "$INPUT_PROJECT_ID"
+              --version "$INPUT_VERSION")
+        [[ -n "$INPUT_BASELINE_FILE"  ]] && args+=(--baseline "$INPUT_BASELINE_FILE")
+        [[ -n "$INPUT_BACKEND_URL"    ]] && args+=(--backend-url "$INPUT_BACKEND_URL")
+        [[ -n "$INPUT_INGEST_KEY"     ]] && args+=(--ingest-key "$INPUT_INGEST_KEY")
+        [[ -n "$INPUT_DASHBOARD_KEY"  ]] && args+=(--dashboard-key "$INPUT_DASHBOARD_KEY")
+        [[ -n "$INPUT_CONFIGURE_URL"  ]] && args+=(--configure-url "$INPUT_CONFIGURE_URL")
+        [[ "$INPUT_DRY_RUN" == "true" ]] && args+=(--dry-run)
+
+        # Action source lives next to action.yml — GITHUB_ACTION_PATH points here.
+        bun run "$GITHUB_ACTION_PATH/src/entry.ts" "${args[@]}"
