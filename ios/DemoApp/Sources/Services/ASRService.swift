@@ -57,11 +57,19 @@ final class ASRService: NSObject, ObservableObject {
     /// Permission gauntlet. Run once on app start or on first mic tap.
     /// Both permissions are required; either denial means we can't demo.
     ///
+    /// `nonisolated` because the TCC/Speech framework callbacks fire on a
+    /// background XPC-reply queue. Without this, the inner `{ granted in ... }`
+    /// and `{ status in ... }` closures inherit `@MainActor` isolation from
+    /// the enclosing class, and Swift 6 runtime trips a
+    /// `dispatch_assert_queue_fail` SIGTRAP the moment iOS posts the
+    /// authorization result — which looks exactly like the app crashing on
+    /// first launch when the permission prompt returns.
+    ///
     /// Mic permission API split: iOS 17 moved to `AVAudioApplication.requestRecordPermission`.
     /// Deployment target is 16.4, so we branch — the old
     /// `AVAudioSession.requestRecordPermission` is deprecated-but-available on 17
     /// and still the only option on 16.x.
-    static func requestPermissions() async -> Bool {
+    nonisolated static func requestPermissions() async -> Bool {
         let mic = await withCheckedContinuation { (c: CheckedContinuation<Bool, Never>) in
             if #available(iOS 17.0, *) {
                 AVAudioApplication.requestRecordPermission { granted in c.resume(returning: granted) }
