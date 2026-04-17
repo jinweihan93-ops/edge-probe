@@ -52,3 +52,6 @@ ios/XCFrameworks/*.xcframework
 backend/dist/
 web/.output/
 web/build/
+
+# XCFramework workflow scratch (slice 8 — scripts/build-xcframework.sh output)
+build/xcframework/

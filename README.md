@@ -57,6 +57,65 @@ That is the whole pitch. The SDK captures the span, exports it to the backend, a
 5. SDK drops oldest on buffer overflow, counter emitted as metric
 6. `EdgeProbe.start()` is idempotent
 
+## XCFramework builds (llama.cpp / whisper.cpp)
+
+The SDK's `Package.swift` will pin llama.cpp and whisper.cpp as
+`binaryTarget()` entries pointing at prebuilt XCFrameworks. Hand-building
+those across the `{ios, ios-simulator, macos} × {arm64, x86_64}` matrix
+every time upstream ships a tag is eng toil we want to pay down once.
+
+`.github/workflows/xcframework.yml` fans the matrix out on macOS runners,
+strips + lipos + zips the slices, and attaches them to a GitHub release
+named `xcframeworks-<llama-tag>-<whisper-tag>`. Two entrypoints:
+
+**Manual (founder testing a new upstream tag):**
+
+```bash
+# Dry-run first — prints the build plan for each matrix cell without compiling.
+gh workflow run xcframework.yml \
+  -f llama_cpp_tag=b4321 \
+  -f whisper_cpp_tag=v1.7.2 \
+  -f dry_run=true
+
+# When ready, flip dry_run=false. Same invocation, compile + assemble + draft release.
+gh workflow run xcframework.yml \
+  -f llama_cpp_tag=b4321 \
+  -f whisper_cpp_tag=v1.7.2 \
+  -f dry_run=false
+```
+
+**Automated (watcher on upstream releases):**
+
+```bash
+# A cron or external watcher fires a repository_dispatch event. The workflow
+# builds real (not dry-run) on this path — unattended bumps land as draft
+# releases for review, never auto-published.
+gh api -X POST repos/:owner/:repo/dispatches \
+  -f event_type=llama-cpp-release \
+  -f client_payload[tag]=b4321
+```
+
+**Local sanity check:**
+
+```bash
+# The workflow delegates all real work to scripts/build-xcframework.sh.
+# Running it locally with no --real prints the exact command list the
+# workflow would execute for that matrix cell.
+scripts/build-xcframework.sh --target ios --arch arm64 \
+  --llama-tag b4321 --whisper-tag v1.7.2
+
+scripts/build-xcframework.sh --assemble \
+  --llama-tag b4321 --whisper-tag v1.7.2
+```
+
+**Current gating.** The `--real` code paths in `scripts/build-xcframework.sh`
+are stubbed: they log the plan and write placeholder zips so the release
+upload step has something to attach. The compile is deferred until
+`Package.swift` actually references a `binaryTarget()` pin — shipping
+orphan artifacts before then would just rot in Releases. When the pin
+flips on, the TODO markers in `do_slice_real` / `do_assemble_real` become
+the live command list.
+
 ## VoiceProbe reference demo (`ios/DemoApp`)
 
 VoiceProbe is the "does the SDK trace a real on-device turn" demo. It

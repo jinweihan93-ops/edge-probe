@@ -1,0 +1,209 @@
+name: Build XCFrameworks (llama.cpp / whisper.cpp)
+
+# One-time eng investment that pays back every llama.cpp bump.
+#
+# Triggered two ways:
+#   1. workflow_dispatch (manual) — founder types `gh workflow run xcframework.yml -f llama_cpp_tag=b4321`
+#      while testing a new upstream tag locally before cutting a real release.
+#   2. repository_dispatch (automated) — a separate watcher workflow (or cron)
+#      fires an event like `{ "event_type": "llama-cpp-release", "client_payload": {"tag": "b4321"} }`
+#      when upstream ships a new tag. Keeps the SDK's binaryTarget() pins
+#      current without eng burn per bump.
+#
+# What it does:
+#   - Builds llama.cpp + whisper.cpp as XCFrameworks across the iOS / iOS
+#     simulator / macOS × arm64 / x86_64 matrix that host apps actually ship.
+#   - Strips, lipos, packages as .xcframework bundles.
+#   - Uploads as GitHub release assets so the SDK's Package.swift `binaryTarget()`
+#     points at a stable URL + checksum per upstream tag.
+#
+# Scope per Slice 8 in docs/SLICES.md:
+#   - This slice ships the workflow SHAPE + dry-run success. The real
+#     compile is invoked but the `scripts/build-xcframework.sh` helper
+#     short-circuits to a printed plan unless `--real` is passed. Turning
+#     on `--real` is a follow-up once the SDK actually consumes the
+#     generated XCFrameworks (currently binaryTarget() is not yet wired).
+
+on:
+  workflow_dispatch:
+    inputs:
+      llama_cpp_tag:
+        description: "llama.cpp tag to build (e.g. b4321). Leave blank to skip."
+        required: false
+        default: ""
+      whisper_cpp_tag:
+        description: "whisper.cpp tag to build (e.g. v1.7.2). Leave blank to skip."
+        required: false
+        default: ""
+      dry_run:
+        description: "Print the plan and exit 0 without compiling."
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+  repository_dispatch:
+    # Fired externally by a watcher. Event payload shape:
+    #   { "event_type": "llama-cpp-release" | "whisper-cpp-release",
+    #     "client_payload": { "tag": "b4321" } }
+    types:
+      - llama-cpp-release
+      - whisper-cpp-release
+
+concurrency:
+  # Serialize on the target tags so two concurrent watchers don't double-build.
+  group: xcframework-${{ github.event.inputs.llama_cpp_tag || github.event.client_payload.tag }}-${{ github.event.inputs.whisper_cpp_tag || '' }}
+  cancel-in-progress: false
+
+jobs:
+  # Resolve which tags this run is actually building. Works for both manual
+  # workflow_dispatch (reads inputs) and repository_dispatch (reads client_payload).
+  # All matrix jobs fan out from this step so a single source of truth drives
+  # the plan.
+  resolve:
+    name: Resolve tags
+    runs-on: ubuntu-latest
+    outputs:
+      llama_tag: ${{ steps.pick.outputs.llama_tag }}
+      whisper_tag: ${{ steps.pick.outputs.whisper_tag }}
+      dry_run: ${{ steps.pick.outputs.dry_run }}
+    steps:
+      - id: pick
+        run: |
+          set -euo pipefail
+          event="${{ github.event_name }}"
+          llama_tag=""
+          whisper_tag=""
+          dry_run="true"
+
+          if [ "$event" = "workflow_dispatch" ]; then
+            llama_tag="${{ github.event.inputs.llama_cpp_tag }}"
+            whisper_tag="${{ github.event.inputs.whisper_cpp_tag }}"
+            dry_run="${{ github.event.inputs.dry_run }}"
+          elif [ "$event" = "repository_dispatch" ]; then
+            # Watcher picks up ONE upstream at a time; payload.tag is either llama's or whisper's
+            # depending on event_type.
+            case "${{ github.event.action }}" in
+              llama-cpp-release)  llama_tag="${{ github.event.client_payload.tag }}" ;;
+              whisper-cpp-release) whisper_tag="${{ github.event.client_payload.tag }}" ;;
+            esac
+            dry_run="false"
+          fi
+
+          echo "llama_tag=$llama_tag"     >> "$GITHUB_OUTPUT"
+          echo "whisper_tag=$whisper_tag" >> "$GITHUB_OUTPUT"
+          echo "dry_run=$dry_run"         >> "$GITHUB_OUTPUT"
+
+          echo "── resolved build inputs ───────────────"
+          echo "  llama_cpp_tag   = ${llama_tag:-<skip>}"
+          echo "  whisper_cpp_tag = ${whisper_tag:-<skip>}"
+          echo "  dry_run         = $dry_run"
+          echo "────────────────────────────────────────"
+
+  build:
+    name: Build ${{ matrix.target }}-${{ matrix.arch }}
+    needs: [resolve]
+    runs-on: macos-14
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [ios, ios-simulator, macos]
+        arch: [arm64, x86_64]
+        exclude:
+          # iOS devices are arm64-only — no x86_64 phones ever shipped.
+          - target: ios
+            arch: x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.0.app
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          cmake --version || echo "(cmake not yet installed — script will brew install if needed)"
+
+      - name: Build slice (${{ matrix.target }}-${{ matrix.arch }})
+        env:
+          LLAMA_CPP_TAG: ${{ needs.resolve.outputs.llama_tag }}
+          WHISPER_CPP_TAG: ${{ needs.resolve.outputs.whisper_tag }}
+          DRY_RUN: ${{ needs.resolve.outputs.dry_run }}
+        run: |
+          set -euo pipefail
+          scripts/build-xcframework.sh \
+            --target "${{ matrix.target }}" \
+            --arch   "${{ matrix.arch }}" \
+            --llama-tag   "${LLAMA_CPP_TAG:-}" \
+            --whisper-tag "${WHISPER_CPP_TAG:-}" \
+            $([ "${DRY_RUN:-true}" = "false" ] && echo --real)
+
+      - name: Upload slice artifact
+        if: ${{ needs.resolve.outputs.dry_run == 'false' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: slice-${{ matrix.target }}-${{ matrix.arch }}
+          path: build/xcframework/slices/${{ matrix.target }}-${{ matrix.arch }}
+          if-no-files-found: ignore
+          retention-days: 7
+
+  assemble:
+    name: Assemble XCFrameworks + release
+    needs: [resolve, build]
+    # Only assemble on real runs. Dry runs stop at the per-slice plan.
+    if: ${{ needs.resolve.outputs.dry_run == 'false' }}
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.0.app
+
+      - name: Download all slices
+        uses: actions/download-artifact@v4
+        with:
+          pattern: slice-*
+          path: build/xcframework/slices
+
+      - name: Assemble XCFrameworks
+        env:
+          LLAMA_CPP_TAG: ${{ needs.resolve.outputs.llama_tag }}
+          WHISPER_CPP_TAG: ${{ needs.resolve.outputs.whisper_tag }}
+        run: |
+          scripts/build-xcframework.sh --assemble \
+            --llama-tag   "${LLAMA_CPP_TAG:-}" \
+            --whisper-tag "${WHISPER_CPP_TAG:-}" \
+            --real
+
+      - name: Compute checksums
+        id: checksums
+        run: |
+          set -euo pipefail
+          cd build/xcframework/out
+          shasum -a 256 *.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # Tag name combines both upstream tags so SDK consumers pin to a single
+          # SDK-side release (what binaryTarget() actually references).
+          tag_name: xcframeworks-${{ needs.resolve.outputs.llama_tag || 'nollama' }}-${{ needs.resolve.outputs.whisper_tag || 'nowhisper' }}
+          name: "XCFrameworks · llama ${{ needs.resolve.outputs.llama_tag || '—' }} · whisper ${{ needs.resolve.outputs.whisper_tag || '—' }}"
+          body: |
+            Prebuilt XCFrameworks for the SDK's `binaryTarget()` pins.
+
+            Sources:
+            - llama.cpp @ `${{ needs.resolve.outputs.llama_tag || '<skipped>' }}`
+            - whisper.cpp @ `${{ needs.resolve.outputs.whisper_tag || '<skipped>' }}`
+
+            Attach `SHA256SUMS.txt` to your Package.swift
+            `.binaryTarget(url:, checksum:)` entry.
+          files: |
+            build/xcframework/out/*.zip
+            build/xcframework/out/SHA256SUMS.txt
+          draft: true
