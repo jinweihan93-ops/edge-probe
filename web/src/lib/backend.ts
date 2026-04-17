@@ -11,9 +11,15 @@
  * compile error, not a runtime leak.
  */
 
-import type { PublicSpan, PrivateSpan, Trace } from "../../../backend/src/views.ts"
+import type {
+  PublicSpan,
+  PrivateSpan,
+  Trace,
+  ProjectSummary,
+  TraceSummary,
+} from "../../../backend/src/views.ts"
 
-export type { PublicSpan, PrivateSpan, Trace }
+export type { PublicSpan, PrivateSpan, Trace, ProjectSummary, TraceSummary }
 
 /** Subset of Trace that both public and private responses carry safely. */
 export interface PublicTraceHeader {
@@ -81,6 +87,45 @@ export class BackendClient {
     })
     if (!res.ok) return { status: res.status, body: null }
     return { status: res.status, body: (await res.json()) as PrivateTraceResponse }
+  }
+
+  /**
+   * Dashboard: list projects for the authed org. Returns `[]` on any
+   * non-200 — 401 / 404 / network blip all collapse to empty to match the
+   * page handler's "show the empty state" behavior.
+   */
+  async listProjects(bearer: string): Promise<{ status: number; projects: ProjectSummary[] }> {
+    const res = await this.fetchImpl(`${this.baseUrl}/app/projects`, {
+      headers: { Authorization: `Bearer ${bearer}` },
+    })
+    if (!res.ok) return { status: res.status, projects: [] }
+    const body = (await res.json()) as { projects: ProjectSummary[] }
+    return { status: res.status, projects: body.projects }
+  }
+
+  /**
+   * Dashboard: list recent traces under one project. Same failure posture
+   * as listProjects — non-200 → empty. Page handler decides whether an
+   * empty list is "the project has no traces yet" or "you don't have access
+   * to this org" based on the status code we return.
+   */
+  async listProjectTraces(
+    projectId: string,
+    bearer: string,
+    opts?: { limit?: number; before?: string },
+  ): Promise<{ status: number; traces: TraceSummary[] }> {
+    const qs = new URLSearchParams()
+    if (opts?.limit) qs.set("limit", String(opts.limit))
+    if (opts?.before) qs.set("before", opts.before)
+    const url = `${this.baseUrl}/app/projects/${encodeURIComponent(projectId)}/traces${
+      qs.size > 0 ? `?${qs.toString()}` : ""
+    }`
+    const res = await this.fetchImpl(url, {
+      headers: { Authorization: `Bearer ${bearer}` },
+    })
+    if (!res.ok) return { status: res.status, traces: [] }
+    const body = (await res.json()) as { traces: TraceSummary[] }
+    return { status: res.status, traces: body.traces }
   }
 
   /**

@@ -3,8 +3,29 @@ import { serveStatic } from "hono/bun"
 import { BackendClient } from "./lib/backend.ts"
 import { PublicTracePage } from "./pages/publicTrace.tsx"
 import { PrivateTracePage } from "./pages/privateTrace.tsx"
+import { AppHomePage } from "./pages/appHome.tsx"
+import { ProjectDetailPage } from "./pages/projectDetail.tsx"
 import { NotFoundPage } from "./pages/notFound.tsx"
 import { parseOrgBearerMap } from "./lib/bearerMap.ts"
+
+/**
+ * Resolve the requesting org from `?org=` + `orgBearers`. Returns either a
+ * concrete {orgId, bearer} pair or a response to short-circuit with.
+ * Centralized so every auth'd page uses the same rules:
+ *   - No bearer for the requested org → 401
+ *   - `?org=` omitted AND the caller has exactly one bearer → use that one
+ *   - `?org=` omitted AND the caller has zero or >1 bearers → 401
+ */
+function resolveOrg(
+  queryOrg: string | undefined,
+  orgBearers: Map<string, string>,
+): { orgId: string; bearer: string } | null {
+  const orgId = queryOrg ?? (orgBearers.size === 1 ? [...orgBearers.keys()][0] : undefined)
+  if (!orgId) return null
+  const bearer = orgBearers.get(orgId)
+  if (!bearer) return null
+  return { orgId, bearer }
+}
 
 /**
  * EdgeProbe web dashboard.
@@ -107,6 +128,52 @@ export function createWebApp(deps: WebDeps) {
   })
 
   /**
+   * GET /app — home dashboard. Lists projects under the requesting org.
+   *
+   * Auth model: same as `/app/trace/:id`. `?org=` selects an org the user
+   * already has a bearer for; it cannot grant access.
+   */
+  app.get("/app", async (c) => {
+    const resolved = resolveOrg(c.req.query("org"), orgBearers)
+    if (!resolved) {
+      return c.html(<NotFoundPage />, 401)
+    }
+    const { status, projects } = await backend.listProjects(resolved.bearer)
+    if (status === 401 || status === 403) {
+      return c.html(<NotFoundPage />, status as 401 | 403)
+    }
+    return c.html(<AppHomePage projects={projects} orgId={resolved.orgId} />)
+  })
+
+  /**
+   * GET /app/projects/:projectId — recent traces for one project.
+   *
+   * Cross-project poking across orgs: the backend already scopes the
+   * query to (orgId from bearer, projectId from path). Unknown projectId
+   * just renders the empty state — there's no "project exists but you
+   * can't see it" error because there's nothing to leak from an empty
+   * result.
+   */
+  app.get("/app/projects/:projectId", async (c) => {
+    const resolved = resolveOrg(c.req.query("org"), orgBearers)
+    if (!resolved) {
+      return c.html(<NotFoundPage />, 401)
+    }
+    const projectId = c.req.param("projectId")
+    const { status, traces } = await backend.listProjectTraces(projectId, resolved.bearer)
+    if (status === 401 || status === 403) {
+      return c.html(<NotFoundPage />, status as 401 | 403)
+    }
+    return c.html(
+      <ProjectDetailPage
+        projectId={projectId}
+        orgId={resolved.orgId}
+        traces={traces}
+      />,
+    )
+  })
+
+  /**
    * GET /app/trace/:id — authenticated dashboard detail.
    *
    * Auth model: the user's org is looked up in `orgBearers`, which is
@@ -121,31 +188,18 @@ export function createWebApp(deps: WebDeps) {
    * way as per Critical Path #2.
    */
   app.get("/app/trace/:id", async (c) => {
-    const queryOrg = c.req.query("org")
-    // Prod TODO: read orgId from the signed-in session cookie instead of
-    // the query string. For now env-driven bearers + ?org= is the dev flow.
-    const orgId = queryOrg ?? (orgBearers.size === 1 ? [...orgBearers.keys()][0] : undefined)
-    if (!orgId) {
-      return c.html(
-        <NotFoundPage reason="This page requires org context. Pass ?org=your_org_id for dev, or sign in." />,
-        401,
-      )
-    }
-
-    const bearer = orgBearers.get(orgId)
-    if (!bearer) {
-      // The caller has no bearer for the requested org. Don't give them a
-      // "login" page that reveals which orgs exist — collapse to 404/401.
+    const resolved = resolveOrg(c.req.query("org"), orgBearers)
+    if (!resolved) {
       return c.html(<NotFoundPage />, 401)
     }
 
-    const { status, body } = await backend.fetchPrivate(c.req.param("id"), bearer)
+    const { status, body } = await backend.fetchPrivate(c.req.param("id"), resolved.bearer)
     if (!body) {
       // 401, 403, 404 — all collapse to the same not-found page for the
       // public-facing guarantee. The status code we return mirrors the backend.
       return c.html(<NotFoundPage />, status as 401 | 403 | 404)
     }
-    return c.html(<PrivateTracePage data={body} orgId={orgId} />)
+    return c.html(<PrivateTracePage data={body} orgId={resolved.orgId} />)
   })
 
   return app

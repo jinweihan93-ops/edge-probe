@@ -231,6 +231,43 @@ if [ "$HEADER_ONLY_STATUS" != "401" ]; then
 fi
 echo "[e2e]   → bare X-Org-Id ignored, returns 401 ✓"
 
+# ---- 6c. GET /app/projects (auth'd) — project roll-up carries our trace ----
+echo "[e2e] GET /app/projects"
+curl -fsS -H "Authorization: Bearer $DASH_KEY_ACME" \
+  "$BASE/app/projects" > /tmp/edgeprobe-projects.json
+if ! grep -q "proj_voice" /tmp/edgeprobe-projects.json; then
+  echo "[e2e] FAIL: /app/projects didn't surface proj_voice" >&2
+  cat /tmp/edgeprobe-projects.json >&2
+  exit 1
+fi
+echo "[e2e]   → projects list carries proj_voice ✓"
+
+# ---- 6d. GET /app/projects/proj_voice/traces (auth'd) — surfaces our trace id ----
+echo "[e2e] GET /app/projects/proj_voice/traces"
+curl -fsS -H "Authorization: Bearer $DASH_KEY_ACME" \
+  "$BASE/app/projects/proj_voice/traces" > /tmp/edgeprobe-project-traces.json
+if ! grep -q "$TRACE_ID" /tmp/edgeprobe-project-traces.json; then
+  echo "[e2e] FAIL: /app/projects/proj_voice/traces didn't surface $TRACE_ID" >&2
+  cat /tmp/edgeprobe-project-traces.json >&2
+  exit 1
+fi
+# Content must NOT leak into the summary rows — only timings + model name + device.
+if grep -q "SECRET USER PROMPT" /tmp/edgeprobe-project-traces.json; then
+  echo "[e2e] FAIL: project-traces list carries prompt text — PII BOUNDARY BREACH" >&2
+  exit 1
+fi
+echo "[e2e]   → project-traces list has our trace, no prompt text ✓"
+
+# ---- 6e. Same endpoint with the wrong bearer — empty list, not content ----
+echo "[e2e] GET /app/projects/proj_voice/traces (competitor bearer)"
+curl -fsS -H "Authorization: Bearer $DASH_KEY_COMP" \
+  "$BASE/app/projects/proj_voice/traces" > /tmp/edgeprobe-project-traces-cross.json
+if grep -q "$TRACE_ID" /tmp/edgeprobe-project-traces-cross.json; then
+  echo "[e2e] FAIL: cross-org project-traces returned acme's trace id — ISOLATION BREACH" >&2
+  exit 1
+fi
+echo "[e2e]   → cross-org project-traces returns no acme data ✓"
+
 # ---- 7. GET /app/trace/unknown_id with a valid bearer — must be 404 ----
 echo "[e2e] GET /app/trace/never_existed_$RANDOM"
 NOT_FOUND_STATUS=$(curl -sS -o /dev/null -w "%{http_code}" \
@@ -346,6 +383,36 @@ if ! grep -q "Captured content" /tmp/edgeprobe-web-private.html; then
   exit 1
 fi
 echo "[e2e]   → auth'd HTML shows content ✓"
+
+# ---- 11b. GET web /app?org=<owning> — projects list HTML ----
+echo "[e2e] GET $WEB_BASE/app?org=org_acme"
+curl -fsS "$WEB_BASE/app?org=org_acme" > /tmp/edgeprobe-web-home.html
+if ! grep -q "Projects" /tmp/edgeprobe-web-home.html; then
+  echo "[e2e] FAIL: /app home missing Projects header" >&2
+  exit 1
+fi
+if ! grep -q "proj_voice" /tmp/edgeprobe-web-home.html; then
+  echo "[e2e] FAIL: /app home missing proj_voice row" >&2
+  exit 1
+fi
+if ! grep -q "list-row-table" /tmp/edgeprobe-web-home.html; then
+  echo "[e2e] FAIL: /app home isn't using list-row-table (design regression)" >&2
+  exit 1
+fi
+echo "[e2e]   → /app home renders projects list ✓"
+
+# ---- 11c. GET web /app/projects/proj_voice?org=<owning> — traces list HTML ----
+echo "[e2e] GET $WEB_BASE/app/projects/proj_voice?org=org_acme"
+curl -fsS "$WEB_BASE/app/projects/proj_voice?org=org_acme" > /tmp/edgeprobe-web-project.html
+if ! grep -q "$TRACE_ID" /tmp/edgeprobe-web-project.html; then
+  echo "[e2e] FAIL: project detail missing trace id $TRACE_ID" >&2
+  exit 1
+fi
+if grep -q "SECRET USER PROMPT" /tmp/edgeprobe-web-project.html; then
+  echo "[e2e] FAIL: project detail HTML leaked prompt text — PII BOUNDARY BREACH" >&2
+  exit 1
+fi
+echo "[e2e]   → /app/projects/proj_voice renders trace rows, no prompt text ✓"
 
 # ---- 12. GET web /app/trace/:id?org=<other> — 403 and no prompt text ----
 echo "[e2e] GET $WEB_BASE/app/trace/$TRACE_ID?org=org_competitor"

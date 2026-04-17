@@ -98,6 +98,53 @@ function toPublicSpan(stored: StoredSpan): PublicSpan {
   }
 }
 
+// ----- Dashboard aggregate types (project + trace lists) -----
+
+/**
+ * Row shape for the `/app` home dashboard. Numbers over adjectives — if a
+ * field can be counted, we count it. No free-text summaries at this tier.
+ */
+export interface ProjectSummary {
+  projectId: string
+  /** Last trace's `started_at` for this project. ISO8601. */
+  lastTraceAt: string | null
+  /** Total traces stored for this project under the requesting org. */
+  traceCount: number
+}
+
+/**
+ * Row shape for the `/app/projects/:id/traces` list. Keeps the payload
+ * small — the detail page is one click away, so we only surface what the
+ * row needs: identity, timing, and an at-a-glance device/model label.
+ *
+ * `modelName` is a best-effort lift from the first LLM span's
+ * `gen_ai.request.model`. Could be null for traces that didn't run an LLM
+ * span (e.g. ASR-only).
+ */
+export interface TraceSummary {
+  id: string
+  projectId: string
+  sessionId: string | null
+  startedAt: string
+  endedAt: string | null
+  /** ms between startedAt and endedAt when both set, else null. */
+  durationMs: number | null
+  status: "ok" | "error"
+  sensitive: boolean
+  /** `device.model` if the SDK supplied one; null otherwise. */
+  deviceModel: string | null
+  /** First llm span's `gen_ai.request.model`; null if no llm span. */
+  modelName: string | null
+  spanCount: number
+}
+
+export interface ListTracesOpts {
+  /** Default 25, capped at 100. */
+  limit?: number
+  /** Cursor: only return traces strictly earlier than this ISO8601. */
+  before?: string
+}
+
 // ----- Storage interface + in-memory implementation -----
 //
 // `SpanStore` is async because the real implementation (PgSpanStore) needs
@@ -109,6 +156,17 @@ export interface SpanStore {
   insertSpan(s: StoredSpan): Promise<void>
   getTrace(id: string): Promise<Trace | undefined>
   getSpansForTrace(traceId: string): Promise<StoredSpan[]>
+  /**
+   * Project roll-up for the `/app` home dashboard. Returned newest-first by
+   * lastTraceAt. Orgs with zero traces return `[]`.
+   */
+  listProjects(orgId: string): Promise<ProjectSummary[]>
+  /**
+   * Trace list for one project. Newest-first by startedAt. Pagination is
+   * cursor-based on `startedAt` so new writes don't disturb existing
+   * pages. No `offset` because that's a footgun at scale.
+   */
+  listTraces(orgId: string, projectId: string, opts?: ListTracesOpts): Promise<TraceSummary[]>
 }
 
 export class InMemorySpanStore implements SpanStore {
@@ -133,10 +191,92 @@ export class InMemorySpanStore implements SpanStore {
     return this.spansByTrace.get(traceId) ?? []
   }
 
+  async listProjects(orgId: string): Promise<ProjectSummary[]> {
+    const byProject = new Map<string, { lastTraceAt: string | null; count: number }>()
+    for (const t of this.traces.values()) {
+      if (t.orgId !== orgId) continue
+      const existing = byProject.get(t.projectId) ?? { lastTraceAt: null, count: 0 }
+      existing.count += 1
+      if (!existing.lastTraceAt || t.startedAt > existing.lastTraceAt) {
+        existing.lastTraceAt = t.startedAt
+      }
+      byProject.set(t.projectId, existing)
+    }
+    const rows: ProjectSummary[] = [...byProject.entries()].map(([projectId, v]) => ({
+      projectId,
+      lastTraceAt: v.lastTraceAt,
+      traceCount: v.count,
+    }))
+    // Newest-first. Null lastTraceAt (shouldn't happen — every row we saw
+    // contributed a started_at) sorts last.
+    rows.sort((a, b) => {
+      if (!a.lastTraceAt) return 1
+      if (!b.lastTraceAt) return -1
+      return b.lastTraceAt.localeCompare(a.lastTraceAt)
+    })
+    return rows
+  }
+
+  async listTraces(
+    orgId: string,
+    projectId: string,
+    opts?: ListTracesOpts,
+  ): Promise<TraceSummary[]> {
+    const limit = clampLimit(opts?.limit)
+    const before = opts?.before
+    const candidates: Trace[] = []
+    for (const t of this.traces.values()) {
+      if (t.orgId !== orgId) continue
+      if (t.projectId !== projectId) continue
+      if (before && !(t.startedAt < before)) continue
+      candidates.push(t)
+    }
+    candidates.sort((a, b) => b.startedAt.localeCompare(a.startedAt))
+    const page = candidates.slice(0, limit)
+    return page.map((t) => this.summarizeTrace(t))
+  }
+
+  private summarizeTrace(t: Trace): TraceSummary {
+    const spans = this.spansByTrace.get(t.id) ?? []
+    let status: "ok" | "error" = "ok"
+    let modelName: string | null = null
+    for (const s of spans) {
+      if (s.status === "error") status = "error"
+      if (!modelName && s.kind === "llm") {
+        const m = s.attributes["gen_ai.request.model"]
+        if (typeof m === "string") modelName = m
+      }
+    }
+    const durationMs = t.endedAt
+      ? Math.max(0, Date.parse(t.endedAt) - Date.parse(t.startedAt))
+      : null
+    const deviceModel = typeof t.device["model"] === "string"
+      ? (t.device["model"] as string)
+      : null
+    return {
+      id: t.id,
+      projectId: t.projectId,
+      sessionId: t.sessionId,
+      startedAt: t.startedAt,
+      endedAt: t.endedAt,
+      durationMs,
+      status,
+      sensitive: t.sensitive,
+      deviceModel,
+      modelName,
+      spanCount: spans.length,
+    }
+  }
+
   reset(): void {
     this.traces.clear()
     this.spansByTrace.clear()
   }
+}
+
+function clampLimit(v: number | undefined): number {
+  if (!v || v <= 0) return 25
+  return Math.min(Math.floor(v), 100)
 }
 
 // ----- Views — the only way endpoints read spans -----

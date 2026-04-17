@@ -217,6 +217,56 @@ export function createApp(deps: AppDeps) {
   }) // END GET /og/:filename
 
   /**
+   * GET /app/projects — list projects under the authenticated org.
+   *
+   * Scope: project-level roll-up for the `/app` home dashboard. Each row
+   * carries `projectId`, `lastTraceAt`, and `traceCount`. No cross-org data
+   * can leak because `listProjects()` filters on the `orgId` resolved from
+   * the bearer — not from a query param, not from a header.
+   */
+  app.get("/app/projects", async (c) => {
+    const orgId = getAuthenticatedOrg(c, dashboardKeys)
+    if (!orgId) {
+      return c.json({ error: "unauthorized" }, 401)
+    }
+    const projects = await store.listProjects(orgId)
+    return c.json({ projects })
+  })
+
+  /**
+   * GET /app/projects/:projectId/traces — list of recent traces for one
+   * project under the authenticated org.
+   *
+   * Query params:
+   *   - `limit` (default 25, cap 100)
+   *   - `before` (ISO8601; cursor-style — returns traces strictly earlier)
+   *
+   * Cross-project / cross-org poking is a non-event: the query is always
+   * scoped to (orgId from bearer, projectId from path). An attacker who
+   * flips `:projectId` to an org they don't own just gets an empty list,
+   * same as a project with no traces. That's fine — there's nothing to
+   * leak from an empty result.
+   */
+  app.get("/app/projects/:projectId/traces", async (c) => {
+    const orgId = getAuthenticatedOrg(c, dashboardKeys)
+    if (!orgId) {
+      return c.json({ error: "unauthorized" }, 401)
+    }
+    const projectId = c.req.param("projectId")
+    const limitRaw = c.req.query("limit")
+    const before = c.req.query("before")
+    const limit = limitRaw ? Number(limitRaw) : undefined
+    if (limitRaw && (!Number.isFinite(limit) || (limit as number) <= 0)) {
+      return c.json({ error: "invalid limit" }, 400)
+    }
+    const traces = await store.listTraces(orgId, projectId, {
+      limit,
+      before,
+    })
+    return c.json({ traces })
+  })
+
+  /**
    * GET /app/trace/:id — authenticated dashboard view. Full content when opted in.
    * Cross-org scan returns 403, not 404 (Critical Path #2 — never leak existence).
    * Auth: `Authorization: Bearer epk_dash_...` (see auth.ts).

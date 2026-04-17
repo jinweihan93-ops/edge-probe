@@ -32,6 +32,7 @@ export function PrivateTracePage({ data, orgId }: { data: PrivateTraceResponse; 
       title={`Trace ${data.trace.id} · EdgeProbe`}
       ogDescription="Authenticated trace detail"
       pageClass="page--wide"
+      orgId={orgId}
     >
       <header class="section">
         <h1 class="verdict">

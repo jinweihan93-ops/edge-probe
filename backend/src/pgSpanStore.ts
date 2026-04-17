@@ -1,5 +1,12 @@
 import type { Sql } from "./db.ts"
-import type { SpanStore, Trace, StoredSpan } from "./views.ts"
+import type {
+  SpanStore,
+  Trace,
+  StoredSpan,
+  ProjectSummary,
+  TraceSummary,
+  ListTracesOpts,
+} from "./views.ts"
 
 /**
  * `postgres` types sql.json() as strictly JSON-shaped. Our attribute/device
@@ -119,6 +126,97 @@ export class PgSpanStore implements SpanStore {
       transcriptText: r.transcript_text,
     }))
   }
+
+  async listProjects(orgId: string): Promise<ProjectSummary[]> {
+    // One query: per-project trace counts + most recent started_at. Indexed
+    // by (org_id, started_at DESC) from migration 001 so the MAX() lands in
+    // the leading index.
+    const rows = await this.sql<Array<ProjectRow>>`
+      SELECT
+        project_id,
+        MAX(started_at) AS last_trace_at,
+        COUNT(*)::int   AS trace_count
+      FROM traces
+      WHERE org_id = ${orgId}
+      GROUP BY project_id
+      ORDER BY MAX(started_at) DESC
+    `
+    return rows.map((r) => ({
+      projectId: r.project_id,
+      lastTraceAt: r.last_trace_at ? toIso(r.last_trace_at) : null,
+      traceCount: r.trace_count,
+    }))
+  }
+
+  async listTraces(
+    orgId: string,
+    projectId: string,
+    opts?: ListTracesOpts,
+  ): Promise<TraceSummary[]> {
+    const limit = clampLimit(opts?.limit)
+    const before = opts?.before ?? null
+
+    // Pull trace rows first, then fan-out one extra query per trace to
+    // compute the summary (status, modelName, spanCount, deviceModel). At
+    // /app/projects list scale (≤100 traces per page), that's fine; when
+    // it's not, we'll move to a CTE. Leave the TODO for when it matters.
+    const rows = await this.sql<Array<TraceListRow>>`
+      SELECT id, project_id, session_id, started_at, ended_at,
+             device, sensitive
+      FROM traces
+      WHERE org_id = ${orgId}
+        AND project_id = ${projectId}
+        AND (${before}::timestamptz IS NULL OR started_at < ${before}::timestamptz)
+      ORDER BY started_at DESC
+      LIMIT ${limit}
+    `
+
+    const summaries: TraceSummary[] = []
+    for (const r of rows) {
+      const spanRows = await this.sql<Array<SpanSummaryRow>>`
+        SELECT kind, status, attributes
+        FROM spans
+        WHERE trace_id = ${r.id}
+      `
+      let status: "ok" | "error" = "ok"
+      let modelName: string | null = null
+      for (const s of spanRows) {
+        if (s.status === "error") status = "error"
+        if (!modelName && s.kind === "llm") {
+          const attrs = s.attributes as Record<string, unknown>
+          const m = attrs["gen_ai.request.model"]
+          if (typeof m === "string") modelName = m
+        }
+      }
+      const startedAtIso = toIso(r.started_at)
+      const endedAtIso = r.ended_at ? toIso(r.ended_at) : null
+      const durationMs = endedAtIso
+        ? Math.max(0, Date.parse(endedAtIso) - Date.parse(startedAtIso))
+        : null
+      const deviceModel = typeof (r.device as Record<string, unknown>)["model"] === "string"
+        ? ((r.device as Record<string, unknown>)["model"] as string)
+        : null
+      summaries.push({
+        id: r.id,
+        projectId: r.project_id,
+        sessionId: r.session_id,
+        startedAt: startedAtIso,
+        endedAt: endedAtIso,
+        durationMs,
+        status,
+        sensitive: r.sensitive,
+        deviceModel,
+        modelName,
+        spanCount: spanRows.length,
+      })
+    }
+    return summaries
+  }
+}
+
+function clampLimit(v: number | undefined): number {
+  if (!v || v <= 0) return 25
+  return Math.min(Math.floor(v), 100)
 }
 
 function toIso(v: Date | string): string {
@@ -152,4 +250,26 @@ interface SpanRow {
   prompt_text: string | null
   completion_text: string | null
   transcript_text: string | null
+}
+
+interface ProjectRow {
+  project_id: string
+  last_trace_at: Date | null
+  trace_count: number
+}
+
+interface TraceListRow {
+  id: string
+  project_id: string
+  session_id: string | null
+  started_at: Date
+  ended_at: Date | null
+  device: Record<string, unknown>
+  sensitive: boolean
+}
+
+interface SpanSummaryRow {
+  kind: string
+  status: string
+  attributes: Record<string, unknown>
 }

@@ -14,6 +14,12 @@ interface LayoutProps {
   children: Child
   /** When true, no nav bar (for the public share — standalone, shareable, no app chrome). */
   publicSurface?: boolean
+  /**
+   * Org id for the signed-in session, displayed in the nav. Absent on
+   * public surfaces (publicSurface=true) and on truly logged-out renders.
+   * When present, the nav surfaces a Projects link scoped to this org.
+   */
+  orgId?: string
 }
 
 /**
@@ -46,7 +52,7 @@ export function Layout(props: LayoutProps) {
       </head>
       <body>
         <a class="skip-to-content" href="#main">Skip to content</a>
-        {!props.publicSurface && <Nav />}
+        {!props.publicSurface && <Nav orgId={props.orgId} />}
         <main id="main" class={`page ${props.pageClass ?? ""}`.trim()}>
           {props.children}
         </main>
