@@ -14,10 +14,20 @@ import { Metrics } from "../src/metrics.ts"
  * counter incremented. If any of these regress, `edgeprobe_spans_dropped_total`
  * on the /metrics page will silently stop reporting that class — so the
  * test is the only tripwire.
+ *
+ * Slice 5 update: each test that actually sends a well-formed body must
+ * first mint a pub key for the org used in the payload — `/ingest` now
+ * rejects unrecognized tokens before any Slice-4 guard runs. We use
+ * `pubKeyFor(deps, orgId)` to seed + return the bearer header.
  */
 
 const SECRET = "y".repeat(48)
-const PUB_KEY = "Bearer epk_pub_slice4_test"
+
+/** Seed a pub key for `orgId` and return the `Bearer <token>` header value. */
+async function pubKeyFor(deps: AppDeps, orgId: string): Promise<string> {
+  const { rawToken } = await deps.apiKeyStore.mint(orgId, "pub", `test-${orgId}`)
+  return `Bearer ${rawToken}`
+}
 
 function mkPayload(
   overrides: Partial<{ orgId: string; traceId: string; spanCount: number }> = {},
@@ -64,13 +74,14 @@ describe("POST /ingest — payload size cap", () => {
       metrics,
       maxIngestBytes: 500, // tiny cap for test
     })
+    const pubKey = await pubKeyFor(deps, "org_acme")
     const app = createApp(deps)
     const payload = JSON.stringify(mkPayload({ spanCount: 0 }))
     const res = await app.fetch(
       new Request("http://x/ingest", {
         method: "POST",
         headers: {
-          Authorization: PUB_KEY,
+          Authorization: pubKey,
           "Content-Type": "application/json",
           "Content-Length": "99999", // lie big
         },
@@ -87,6 +98,7 @@ describe("POST /ingest — payload size cap", () => {
       metrics,
       maxIngestBytes: 200,
     })
+    const pubKey = await pubKeyFor(deps, "org_acme")
     const app = createApp(deps)
     // Build a >200B payload by padding attributes.
     const padded = mkPayload({ spanCount: 0 })
@@ -94,7 +106,7 @@ describe("POST /ingest — payload size cap", () => {
     const res = await app.fetch(
       new Request("http://x/ingest", {
         method: "POST",
-        headers: { Authorization: PUB_KEY, "Content-Type": "application/json" },
+        headers: { Authorization: pubKey, "Content-Type": "application/json" },
         body: JSON.stringify(padded),
       }),
     )
@@ -104,11 +116,12 @@ describe("POST /ingest — payload size cap", () => {
 
   test("right at cap: accepted", async () => {
     const deps = makeMemoryDeps(SECRET, undefined, { maxIngestBytes: 10 * 1024 })
+    const pubKey = await pubKeyFor(deps, "org_acme")
     const app = createApp(deps)
     const res = await app.fetch(
       new Request("http://x/ingest", {
         method: "POST",
-        headers: { Authorization: PUB_KEY, "Content-Type": "application/json" },
+        headers: { Authorization: pubKey, "Content-Type": "application/json" },
         body: JSON.stringify(mkPayload()),
       }),
     )
@@ -121,13 +134,14 @@ describe("POST /ingest — rate limit", () => {
     const metrics = new Metrics()
     const rateLimiter = new RateLimiter({ spansPerSec: 3, bytesPerDay: 1e9 })
     const deps = makeMemoryDeps(SECRET, undefined, { metrics, rateLimiter })
+    const pubKey = await pubKeyFor(deps, "org_acme")
     const app = createApp(deps)
 
     // First request carries 2 spans, lands.
     const ok = await app.fetch(
       new Request("http://x/ingest", {
         method: "POST",
-        headers: { Authorization: PUB_KEY, "Content-Type": "application/json" },
+        headers: { Authorization: pubKey, "Content-Type": "application/json" },
         body: JSON.stringify(mkPayload({ traceId: "t1", spanCount: 2 })),
       }),
     )
@@ -137,7 +151,7 @@ describe("POST /ingest — rate limit", () => {
     const rate = await app.fetch(
       new Request("http://x/ingest", {
         method: "POST",
-        headers: { Authorization: PUB_KEY, "Content-Type": "application/json" },
+        headers: { Authorization: pubKey, "Content-Type": "application/json" },
         body: JSON.stringify(mkPayload({ traceId: "t2", spanCount: 2 })),
       }),
     )
@@ -152,19 +166,23 @@ describe("POST /ingest — rate limit", () => {
   test("different orgs do NOT share buckets", async () => {
     const rateLimiter = new RateLimiter({ spansPerSec: 2, bytesPerDay: 1e9 })
     const deps = makeMemoryDeps(SECRET, undefined, { rateLimiter })
+    // Slice 5: one pub key per org. A key that authorizes org_a cannot be
+    // used to post as org_b — we seed both explicitly.
+    const keyA = await pubKeyFor(deps, "org_a")
+    const keyB = await pubKeyFor(deps, "org_b")
     const app = createApp(deps)
     // Exhaust org_a.
     await app.fetch(
       new Request("http://x/ingest", {
         method: "POST",
-        headers: { Authorization: PUB_KEY, "Content-Type": "application/json" },
+        headers: { Authorization: keyA, "Content-Type": "application/json" },
         body: JSON.stringify(mkPayload({ orgId: "org_a", traceId: "a1", spanCount: 2 })),
       }),
     )
     const rateA = await app.fetch(
       new Request("http://x/ingest", {
         method: "POST",
-        headers: { Authorization: PUB_KEY, "Content-Type": "application/json" },
+        headers: { Authorization: keyA, "Content-Type": "application/json" },
         body: JSON.stringify(mkPayload({ orgId: "org_a", traceId: "a2", spanCount: 1 })),
       }),
     )
@@ -174,7 +192,7 @@ describe("POST /ingest — rate limit", () => {
     const okB = await app.fetch(
       new Request("http://x/ingest", {
         method: "POST",
-        headers: { Authorization: PUB_KEY, "Content-Type": "application/json" },
+        headers: { Authorization: keyB, "Content-Type": "application/json" },
         body: JSON.stringify(mkPayload({ orgId: "org_b", traceId: "b1", spanCount: 2 })),
       }),
     )
@@ -190,13 +208,14 @@ describe("POST /ingest — content-hash dedup", () => {
       metrics,
       now: () => frozen,
     })
+    const pubKey = await pubKeyFor(deps, "org_acme")
     const app = createApp(deps)
     const body = JSON.stringify(mkPayload({ traceId: "dup_1", spanCount: 3 }))
 
     const first = await app.fetch(
       new Request("http://x/ingest", {
         method: "POST",
-        headers: { Authorization: PUB_KEY, "Content-Type": "application/json" },
+        headers: { Authorization: pubKey, "Content-Type": "application/json" },
         body,
       }),
     )
@@ -210,7 +229,7 @@ describe("POST /ingest — content-hash dedup", () => {
     const second = await app.fetch(
       new Request("http://x/ingest", {
         method: "POST",
-        headers: { Authorization: PUB_KEY, "Content-Type": "application/json" },
+        headers: { Authorization: pubKey, "Content-Type": "application/json" },
         body,
       }),
     )
@@ -231,12 +250,13 @@ describe("POST /ingest — content-hash dedup", () => {
     const deps = makeMemoryDeps(SECRET, undefined, {
       now: () => new Date(t),
     })
+    const pubKey = await pubKeyFor(deps, "org_acme")
     const app = createApp(deps)
     const body = JSON.stringify(mkPayload({ traceId: "bucket_1" }))
     const first = await app.fetch(
       new Request("http://x/ingest", {
         method: "POST",
-        headers: { Authorization: PUB_KEY, "Content-Type": "application/json" },
+        headers: { Authorization: pubKey, "Content-Type": "application/json" },
         body,
       }),
     )
@@ -246,7 +266,7 @@ describe("POST /ingest — content-hash dedup", () => {
     const second = await app.fetch(
       new Request("http://x/ingest", {
         method: "POST",
-        headers: { Authorization: PUB_KEY, "Content-Type": "application/json" },
+        headers: { Authorization: pubKey, "Content-Type": "application/json" },
         body,
       }),
     )
@@ -258,6 +278,10 @@ describe("POST /ingest — content-hash dedup", () => {
   test("identical bodies from different orgs do not collide", async () => {
     const frozen = new Date("2026-04-17T12:00:00Z")
     const deps = makeMemoryDeps(SECRET, undefined, { now: () => frozen })
+    const keys: Record<string, string> = {
+      org_a: await pubKeyFor(deps, "org_a"),
+      org_b: await pubKeyFor(deps, "org_b"),
+    }
     const app = createApp(deps)
 
     // Distinct orgs = different dedup keys even with same trace content.
@@ -265,7 +289,7 @@ describe("POST /ingest — content-hash dedup", () => {
       const res = await app.fetch(
         new Request("http://x/ingest", {
           method: "POST",
-          headers: { Authorization: PUB_KEY, "Content-Type": "application/json" },
+          headers: { Authorization: keys[orgId]!, "Content-Type": "application/json" },
           body: JSON.stringify(mkPayload({ orgId, traceId: `t_${orgId}` })),
         }),
       )
@@ -293,12 +317,13 @@ describe("GET /metrics — Prometheus exposition", () => {
   test("counters reflect /ingest outcomes", async () => {
     const metrics = new Metrics()
     const deps = makeMemoryDeps(SECRET, undefined, { metrics })
+    const pubKey = await pubKeyFor(deps, "org_acme")
     const app = createApp(deps)
 
     await app.fetch(
       new Request("http://x/ingest", {
         method: "POST",
-        headers: { Authorization: PUB_KEY, "Content-Type": "application/json" },
+        headers: { Authorization: pubKey, "Content-Type": "application/json" },
         body: JSON.stringify(mkPayload({ traceId: "m_ok", spanCount: 4 })),
       }),
     )

@@ -2,14 +2,23 @@
 # e2e.sh — end-to-end smoke: SDK wire shape ↔ backend contract ↔ web dashboard.
 #
 # Backend checks:
-# 1. Start the Bun backend on a random port
-# 2. POST an IngestPayload shaped like the one EdgeProbe.trace() emits
-# 3. POST /app/trace/:id/share to mint a signed share token
-# 4. GET /r/<token> and assert no prompt/completion text in the public JSON
-# 5. GET /r/<raw-traceId> returns 404 — raw ids cannot be used as tokens
-# 6. GET /app/trace/:id with the right org and assert we DO see content
-# 7. GET /app/trace/:id with a different org and assert 403 (not 404)
-# 8. GET /app/trace/:id with an unknown id and assert 404
+# 1. Start the Bun backend on a random port. BOOTSTRAP_API_KEYS seeds a
+#    known `epk_priv_` key so the script can bootstrap the admin surface.
+# 2. Mint a fresh `epk_pub_` ingest key via `POST /app/keys` (priv bearer).
+#    Pre-Slice-5 the e2e hardcoded `epk_pub_e2e_key`, but /ingest now
+#    actually authenticates — the bearer must exist in `api_keys`.
+# 3. POST an IngestPayload shaped like the one EdgeProbe.trace() emits,
+#    using the minted pub key.
+# 4. POST /app/trace/:id/share to mint a signed share token
+# 5. GET /r/<token> and assert no prompt/completion text in the public JSON
+# 6. GET /r/<raw-traceId> returns 404 — raw ids cannot be used as tokens
+# 7. GET /app/trace/:id with the right org and assert we DO see content
+# 8. GET /app/trace/:id with a different org and assert 403 (not 404)
+# 9. GET /app/trace/:id with an unknown id and assert 404
+# 10. Slice 5 admin surface: GET /app/keys lists metadata (no raw tokens),
+#     pub bearer cannot mint (401), DELETE /app/keys/:id revokes,
+#     subsequent /ingest with the revoked key returns 401, and
+#     wrong-org-in-payload returns 401 explicitly.
 #
 # Web dashboard checks (HTML layer):
 # 9. Start the web server pointing at the backend
@@ -40,11 +49,21 @@ export SHARE_TOKEN_SECRET="${SHARE_TOKEN_SECRET:-e2e-test-secret-do-not-use-in-p
 
 # Dashboard-key auth. The bearer → orgId mapping is identical to
 # src/auth.ts's TEST_DASHBOARD_KEY_* constants, so the in-tree unit tests
-# and this live-backend smoke exercise the exact same wire shape. Without
-# DASHBOARD_KEYS set the backend now refuses to boot.
+# and this live-backend smoke exercise the exact same wire shape. Dashboard
+# keys are the legacy Slice-3 bootstrap surface; post-Slice-5 `epk_priv_`
+# keys authenticate the same dashboard routes, but we keep DASHBOARD_KEYS
+# wired up so the backwards-compat path stays covered here too.
 DASH_KEY_ACME="epk_dash_acme_test_0000000000000000"
 DASH_KEY_COMP="epk_dash_comp_test_0000000000000000"
 export DASHBOARD_KEYS='{"'"$DASH_KEY_ACME"'":"org_acme","'"$DASH_KEY_COMP"'":"org_competitor"}'
+
+# Slice 5 bootstrap: a known `epk_priv_` key seeded at boot so this script
+# can exercise the /app/keys admin surface without a chicken-and-egg. In
+# prod BOOTSTRAP_API_KEYS is set once when standing up a fresh DB; here we
+# regenerate deterministically so the e2e run is hermetic. The id + secret
+# fields are pure hex to match the parser contract in `src/apiKeys.ts`.
+PRIV_KEY_ACME="epk_priv_acde012345_0123456789abcdef0123456789abcdef"
+export BOOTSTRAP_API_KEYS='{"'"$PRIV_KEY_ACME"'":{"orgId":"org_acme","keyType":"priv","name":"e2e-bootstrap"}}'
 
 cd "$BACKEND_DIR"
 
@@ -76,6 +95,27 @@ for i in $(seq 1 50); do
 done
 
 echo "[e2e] backend up"
+
+# ---- 0. Mint a pub ingest key via the priv admin endpoint ----
+# Pre-Slice-5 the e2e hardcoded `Bearer epk_pub_e2e_key` because /ingest
+# didn't actually authenticate the bearer — it just parsed the prefix and
+# took `trace.orgId` at face value. Post-Slice-5 the key must exist in
+# `api_keys` (argon2id-hashed), so we mint here using the bootstrap priv
+# key and use the returned raw token for every downstream /ingest call.
+echo "[e2e] POST /app/keys (mint ingest pub)"
+MINT_RESP=$(curl -sS -X POST "$BASE/app/keys" \
+  -H "Authorization: Bearer $PRIV_KEY_ACME" \
+  -H "Content-Type: application/json" \
+  --data '{"keyType":"pub","name":"e2e-ingest"}')
+# rawToken is the full `epk_pub_<id>_<secret>` tuple; id is the 10-hex short
+# id we'll hand to DELETE /app/keys/:id later when we exercise revoke.
+PUB_KEY_ACME=$(echo "$MINT_RESP" | sed -n 's/.*"rawToken":"\([^"]*\)".*/\1/p')
+PUB_KEY_ID=$(echo "$MINT_RESP" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+if [ -z "$PUB_KEY_ACME" ] || [ -z "$PUB_KEY_ID" ]; then
+  echo "[e2e] FAIL: could not parse mint response: $MINT_RESP" >&2
+  exit 1
+fi
+echo "[e2e]   → pub key minted (id=$PUB_KEY_ID)"
 
 # ---- payload (the shape EdgeProbe.trace() emits) ----
 TRACE_ID="trace_e2e_$(date +%s)"
@@ -117,7 +157,7 @@ JSON
 echo "[e2e] POST /ingest"
 INGEST_STATUS=$(curl -sS -o /tmp/edgeprobe-ingest.json -w "%{http_code}" \
   -X POST "$BASE/ingest" \
-  -H "Authorization: Bearer epk_pub_e2e_key" \
+  -H "Authorization: Bearer $PUB_KEY_ACME" \
   -H "Content-Type: application/json" \
   --data-binary "$PAYLOAD")
 if [ "$INGEST_STATUS" != "202" ]; then
@@ -283,7 +323,7 @@ echo "[e2e]   → missing trace returns 404 ✓"
 echo "[e2e] POST /ingest (replay — must be deduped)"
 DEDUP_STATUS=$(curl -sS -o /tmp/edgeprobe-dedup.json -w "%{http_code}" \
   -X POST "$BASE/ingest" \
-  -H "Authorization: Bearer epk_pub_e2e_key" \
+  -H "Authorization: Bearer $PUB_KEY_ACME" \
   -H "Content-Type: application/json" \
   --data-binary "$PAYLOAD")
 if [ "$DEDUP_STATUS" != "202" ]; then
@@ -306,7 +346,7 @@ BIG_PAYLOAD='{"trace":{"id":"t_big","orgId":"org_acme","projectId":"p","sessionI
 BIG_PAYLOAD="${BIG_PAYLOAD}\"attributes\":{\"pad\":\"$(printf 'x%.0s' $(seq 1 2000000))\"},\"sensitive\":false},\"spans\":[]}"
 BIG_STATUS=$(printf '%s' "$BIG_PAYLOAD" | curl -sS -o /dev/null -w "%{http_code}" \
   -X POST "$BASE/ingest" \
-  -H "Authorization: Bearer epk_pub_e2e_key" \
+  -H "Authorization: Bearer $PUB_KEY_ACME" \
   -H "Content-Type: application/json" \
   --data-binary @-)
 if [ "$BIG_STATUS" != "413" ]; then
@@ -339,6 +379,139 @@ if ! grep -E 'edgeprobe_spans_dropped_total\{reason="size"\} [1-9]' /tmp/edgepro
   exit 1
 fi
 echo "[e2e]   → /metrics has dedup + size counters incremented ✓"
+
+# ======================================================================
+# Slice 5: /app/keys admin surface + wrong-org-in-payload guard.
+# This block intentionally runs AFTER the happy-path ingest flow so we
+# can use the same minted pub key to exercise revoke → 401. It runs
+# BEFORE the web section so the web tests below are unaffected by any
+# admin-surface side effects (they only touch dashboard read routes).
+# ======================================================================
+
+# ---- 8a. Wrong-org-in-payload — must be 401 ----
+# The pub key we minted above is bound to org_acme. A payload that claims
+# `trace.orgId = "org_competitor"` must be rejected — otherwise a leaked
+# acme key could scribble into the competitor's dashboard.
+echo "[e2e] POST /ingest with body.orgId=org_competitor (acme pub key — must 401)"
+WRONGORG_TRACE="trace_wrongorg_$(date +%s)"
+read -r -d '' WRONGORG_PAYLOAD <<JSON || true
+{
+  "trace": {
+    "id": "$WRONGORG_TRACE",
+    "orgId": "org_competitor",
+    "projectId": "proj_voice",
+    "sessionId": null,
+    "startedAt": "2026-04-15T12:00:00.000Z",
+    "endedAt":   "2026-04-15T12:00:00.200Z",
+    "device": { "device.os": "iOS", "sdk.version": "0.0.1" },
+    "attributes": {},
+    "sensitive": false
+  },
+  "spans": []
+}
+JSON
+WRONGORG_STATUS=$(curl -sS -o /dev/null -w "%{http_code}" \
+  -X POST "$BASE/ingest" \
+  -H "Authorization: Bearer $PUB_KEY_ACME" \
+  -H "Content-Type: application/json" \
+  --data-binary "$WRONGORG_PAYLOAD")
+if [ "$WRONGORG_STATUS" != "401" ]; then
+  echo "[e2e] FAIL: wrong-org-in-payload returned $WRONGORG_STATUS, expected 401" >&2
+  echo "[e2e] A 202 here would let a leaked pub key cross-post into another org." >&2
+  exit 1
+fi
+echo "[e2e]   → wrong-org-in-payload → 401 ✓"
+
+# The /metrics counter for org_mismatch must now be ≥1.
+curl -fsS "$BASE/metrics" > /tmp/edgeprobe-metrics-slice5.txt
+if ! grep -E 'edgeprobe_spans_dropped_total\{reason="org_mismatch"\} [1-9]' /tmp/edgeprobe-metrics-slice5.txt >/dev/null; then
+  echo "[e2e] FAIL: /metrics missing org_mismatch drop counter" >&2
+  cat /tmp/edgeprobe-metrics-slice5.txt >&2
+  exit 1
+fi
+echo "[e2e]   → org_mismatch counter incremented ✓"
+
+# ---- 8b. GET /app/keys (priv bearer) — lists metadata, no secret leak ----
+echo "[e2e] GET /app/keys"
+curl -fsS -H "Authorization: Bearer $PRIV_KEY_ACME" \
+  "$BASE/app/keys" > /tmp/edgeprobe-keys-list.json
+if ! grep -q "$PUB_KEY_ID" /tmp/edgeprobe-keys-list.json; then
+  echo "[e2e] FAIL: /app/keys didn't list the minted pub key id $PUB_KEY_ID" >&2
+  cat /tmp/edgeprobe-keys-list.json >&2
+  exit 1
+fi
+# Must not leak the raw token or the stored hash. A compromised dashboard
+# session is bad, but it should NOT be a way to extract live bearer tokens.
+if grep -q '"rawToken"' /tmp/edgeprobe-keys-list.json; then
+  echo "[e2e] FAIL: /app/keys leaked rawToken field" >&2
+  exit 1
+fi
+if grep -q '"keyHash"' /tmp/edgeprobe-keys-list.json; then
+  echo "[e2e] FAIL: /app/keys leaked keyHash field" >&2
+  exit 1
+fi
+# The raw-token shape itself must not appear in the response either, even
+# under a different key name. Defense in depth against future regressions.
+if grep -qE 'epk_(pub|priv)_[0-9a-f]{10}_[0-9a-f]{32}' /tmp/edgeprobe-keys-list.json; then
+  echo "[e2e] FAIL: /app/keys response contains a raw-token-shaped string" >&2
+  exit 1
+fi
+echo "[e2e]   → /app/keys lists metadata, no raw token / hash leaked ✓"
+
+# ---- 8c. POST /app/keys with a pub bearer — must 401 ----
+# Critical: `epk_pub_` tokens ship in the app bundle. They must NEVER be
+# able to mint new keys, even inside their own org.
+echo "[e2e] POST /app/keys with pub bearer (must 401)"
+PUB_MINT_STATUS=$(curl -sS -o /dev/null -w "%{http_code}" \
+  -X POST "$BASE/app/keys" \
+  -H "Authorization: Bearer $PUB_KEY_ACME" \
+  -H "Content-Type: application/json" \
+  --data '{"keyType":"pub","name":"should-fail"}')
+if [ "$PUB_MINT_STATUS" != "401" ]; then
+  echo "[e2e] FAIL: pub-bearer mint returned $PUB_MINT_STATUS, expected 401" >&2
+  echo "[e2e] A 201 here would let a leaked pub key clone itself indefinitely." >&2
+  exit 1
+fi
+echo "[e2e]   → pub bearer cannot mint → 401 ✓"
+
+# ---- 8d. DELETE /app/keys/:id — revoke the minted pub key ----
+echo "[e2e] DELETE /app/keys/$PUB_KEY_ID"
+REVOKE_STATUS=$(curl -sS -o /dev/null -w "%{http_code}" \
+  -X DELETE "$BASE/app/keys/$PUB_KEY_ID" \
+  -H "Authorization: Bearer $PRIV_KEY_ACME")
+if [ "$REVOKE_STATUS" != "204" ]; then
+  echo "[e2e] FAIL: revoke returned $REVOKE_STATUS, expected 204" >&2
+  exit 1
+fi
+echo "[e2e]   → revoke → 204 ✓"
+
+# A second revoke on the same id must collapse to 404 — same response as
+# "that id doesn't exist at all" to avoid leaking anything about id space.
+echo "[e2e] DELETE /app/keys/$PUB_KEY_ID (already revoked)"
+DOUBLE_STATUS=$(curl -sS -o /dev/null -w "%{http_code}" \
+  -X DELETE "$BASE/app/keys/$PUB_KEY_ID" \
+  -H "Authorization: Bearer $PRIV_KEY_ACME")
+if [ "$DOUBLE_STATUS" != "404" ]; then
+  echo "[e2e] FAIL: double-revoke returned $DOUBLE_STATUS, expected 404" >&2
+  exit 1
+fi
+echo "[e2e]   → double-revoke → 404 ✓"
+
+# ---- 8e. /ingest with the revoked pub key — must be 401 ----
+# The load-bearing Slice 5 gate. Before this point the pub key worked; after
+# DELETE it must stop working, on the SAME backend process, without restart.
+echo "[e2e] POST /ingest with revoked pub key (must 401)"
+POSTREV_STATUS=$(curl -sS -o /dev/null -w "%{http_code}" \
+  -X POST "$BASE/ingest" \
+  -H "Authorization: Bearer $PUB_KEY_ACME" \
+  -H "Content-Type: application/json" \
+  --data-binary "$PAYLOAD")
+if [ "$POSTREV_STATUS" != "401" ]; then
+  echo "[e2e] FAIL: post-revoke ingest returned $POSTREV_STATUS, expected 401" >&2
+  echo "[e2e] A 202 here would mean key revocation is lost — KEY ROTATION BROKEN" >&2
+  exit 1
+fi
+echo "[e2e]   → post-revoke ingest → 401 ✓"
 
 # ======================================================================
 # Web dashboard: same checks, against the rendered HTML surface.

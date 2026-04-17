@@ -1,4 +1,5 @@
 import { Hono } from "hono"
+import type { Context } from "hono"
 import { InMemorySpanStore, SpanViews, type SpanStore, type Trace, type StoredSpan } from "./views.ts"
 import { PgSpanStore } from "./pgSpanStore.ts"
 import { createSQL } from "./db.ts"
@@ -10,11 +11,18 @@ import {
   MAX_SHARE_TTL_SECONDS,
   type ShareTokenSigner,
 } from "./shareToken.ts"
-import { getAuthenticatedOrg, parseDashboardKeys, testDashboardKeys } from "./auth.ts"
+import { DASHBOARD_KEY_PREFIX, parseDashboardKeys, testDashboardKeys } from "./auth.ts"
 import { renderOgPng, renderFallbackPng } from "./og.ts"
 import { RateLimiter } from "./rateLimit.ts"
 import { Metrics } from "./metrics.ts"
 import { contentHash, minuteBucket } from "./ingestHash.ts"
+import {
+  type ApiKeyStore,
+  type KeyType,
+  parseBootstrapKeys,
+} from "./apiKeys.ts"
+import { InMemoryApiKeyStore } from "./inMemoryApiKeyStore.ts"
+import { PgApiKeyStore } from "./pgApiKeyStore.ts"
 
 /** Default ingest guardrails. All env-overridable at boot. */
 export const DEFAULT_INGEST_MAX_BYTES = 1 * 1024 * 1024 // 1 MB / request
@@ -27,11 +35,20 @@ export interface AppDeps {
   views: SpanViews
   signer: ShareTokenSigner
   /**
-   * Boot-time map from dashboard bearer key → orgId. The `/app/*` routes
-   * derive the authenticated org from this table; the client cannot
-   * self-assert an org via a header anymore. See `src/auth.ts`.
+   * Boot-time map from dashboard bearer key → orgId. Legacy surface from
+   * pre-Slice-5 bootstrapping. As of Slice 5, `epk_priv_` keys minted via
+   * `/app/keys` are first-class and can auth any `/app/*` route too — this
+   * map is for operators who still use `DASHBOARD_KEYS` env to wire dev
+   * bootstrap sessions. Either path works; both run through
+   * `authenticateDashboard()`.
    */
   dashboardKeys: Map<string, string>
+  /**
+   * Load-bearing key store. `/ingest` authenticates against this; `/app/keys`
+   * mints + revokes against this; `/app/*` dashboard routes fall back to
+   * this when the presented bearer is `epk_priv_`. See `apiKeys.ts`.
+   */
+  apiKeyStore: ApiKeyStore
   /** Per-org token-bucket limiter. See `rateLimit.ts`. */
   rateLimiter: RateLimiter
   /** In-process counter registry exposed via `GET /metrics`. */
@@ -50,6 +67,38 @@ export interface AppDeps {
 }
 
 /**
+ * Resolve the caller's orgId for a `/app/*` dashboard-style request.
+ *
+ * Accepts either:
+ *   1. A dashboard key registered in `DASHBOARD_KEYS` env (legacy bootstrap).
+ *   2. A fresh `epk_priv_` API key minted via `/app/keys`.
+ *
+ * Returns `null` on missing header, wrong scheme, unknown key, revoked key,
+ * or a bearer that parses as `epk_pub_` (ingest keys cannot read dashboards).
+ * Callers translate `null` → 401.
+ *
+ * Deliberately does not distinguish failure modes to the caller — same
+ * 401 response shape for every reject keeps timing + probing unexciting.
+ */
+export async function authenticateDashboard(
+  c: Context,
+  dashboardKeys: Map<string, string>,
+  apiKeyStore: ApiKeyStore,
+): Promise<string | null> {
+  const auth = c.req.header("Authorization")
+  if (!auth || !auth.startsWith("Bearer ")) return null
+  const key = auth.slice("Bearer ".length).trim()
+  if (key.startsWith(DASHBOARD_KEY_PREFIX)) {
+    return dashboardKeys.get(key) ?? null
+  }
+  if (key.startsWith("epk_priv_")) {
+    const row = await apiKeyStore.verify(key)
+    return row?.orgId ?? null
+  }
+  return null
+}
+
+/**
  * Build a Hono app. Factored this way so tests can construct an isolated
  * instance without shared state (and inject a test-only signer + store).
  *
@@ -58,7 +107,17 @@ export interface AppDeps {
  * two deployments.
  */
 export function createApp(deps: AppDeps) {
-  const { store, views, signer, dashboardKeys, rateLimiter, metrics, maxIngestBytes, now } = deps
+  const {
+    store,
+    views,
+    signer,
+    dashboardKeys,
+    apiKeyStore,
+    rateLimiter,
+    metrics,
+    maxIngestBytes,
+    now,
+  } = deps
   const app = new Hono()
 
   app.get("/healthz", (c) => c.json({ ok: true }))
@@ -80,8 +139,13 @@ export function createApp(deps: AppDeps) {
 
   /**
    * POST /ingest — accepts OTLP-shaped JSON (simplified Day 1 shape).
-   * Auth: `Authorization: Bearer epk_pub_...` (Slice 5 upgrades this from
-   * "any pub-prefixed string lands" to "hashed key lookup with per-key org").
+   *
+   * Auth (Slice 5): `Authorization: Bearer epk_pub_<id>_<secret>`. The key
+   * is looked up in `api_keys` (argon2-verified, revocation-checked), and
+   * the ORG THAT OWNS THE KEY is what we trust for storage. The payload's
+   * `orgId` must match — a mismatch is 401, not "silently overwrite", so a
+   * compromised public key can't be used to scribble into another org's
+   * dashboard.
    *
    * Hardening (Slice 4):
    *   1. Payload size cap (Content-Length + actual bytes).
@@ -94,7 +158,21 @@ export function createApp(deps: AppDeps) {
    */
   app.post("/ingest", async (c) => {
     const auth = c.req.header("Authorization")
-    if (!auth || !auth.startsWith("Bearer epk_pub_")) {
+    if (!auth || !auth.startsWith("Bearer ")) {
+      metrics.inc("edgeprobe_ingest_requests_total", { outcome: "unauthorized" })
+      return c.json({ error: "missing or malformed public ingest key" }, 401)
+    }
+    const rawBearer = auth.slice("Bearer ".length).trim()
+    // We insist on pub tokens here by prefix — not because the prefix proves
+    // anything, but because it gives a cheap reject path before we argon2-
+    // verify. A priv-shaped token short-circuits to 401 without touching the
+    // hash subsystem.
+    if (!rawBearer.startsWith("epk_pub_")) {
+      metrics.inc("edgeprobe_ingest_requests_total", { outcome: "unauthorized" })
+      return c.json({ error: "missing or malformed public ingest key" }, 401)
+    }
+    const verifiedKey = await apiKeyStore.verify(rawBearer)
+    if (!verifiedKey || verifiedKey.keyType !== "pub") {
       metrics.inc("edgeprobe_ingest_requests_total", { outcome: "unauthorized" })
       return c.json({ error: "missing or malformed public ingest key" }, 401)
     }
@@ -131,12 +209,22 @@ export function createApp(deps: AppDeps) {
       return c.json({ error: "invalid ingest payload: need { trace, spans[] }" }, 400)
     }
 
-    // Rate limit on the payload's asserted orgId. Slice 5 will make the
-    // key-to-org mapping load-bearing so we can trust this without a
-    // redundant cross-check here — for now, the "mark but allow" posture
-    // of the old ingest stayed (any epk_pub_... lands), and the bucket is
-    // the first guard against replay floods and bursty clients.
-    const orgId = typeof body.trace.orgId === "string" ? body.trace.orgId : "unknown"
+    // Slice 5 wrong-org-in-payload check. A client holding a valid pub key
+    // for org_acme cannot stuff `trace.orgId = "org_competitor"` and have
+    // the trace land in the competitor's dashboard. 401, not 403: the key
+    // itself is a secret, so even "your key is valid but the orgId is wrong"
+    // doesn't leak anything that matters. One outcome, one response code.
+    if (body.trace.orgId !== verifiedKey.orgId) {
+      metrics.inc("edgeprobe_spans_dropped_total", { reason: "org_mismatch" })
+      metrics.inc("edgeprobe_ingest_requests_total", { outcome: "org_mismatch" })
+      return c.json({ error: "missing or malformed public ingest key" }, 401)
+    }
+
+    // Authoritative orgId from the key — we use this for rate limit + dedup
+    // even though it now equals the payload's orgId. Defense in depth: if
+    // the mismatch check above ever regresses, the rest of the pipeline
+    // still groups on the key's org, not attacker-controlled input.
+    const orgId = verifiedKey.orgId
     const spanCount = body.spans.length
     const decision = rateLimiter.check(orgId, spanCount, bytes.byteLength)
     if (!decision.allowed) {
@@ -204,7 +292,7 @@ export function createApp(deps: AppDeps) {
    */
   app.post("/app/trace/:id/share", async (c) => {
     const id = c.req.param("id")
-    const orgId = getAuthenticatedOrg(c, dashboardKeys)
+    const orgId = await authenticateDashboard(c, dashboardKeys, apiKeyStore)
     if (!orgId) {
       return c.json({ error: "unauthorized" }, 401)
     }
@@ -344,7 +432,7 @@ export function createApp(deps: AppDeps) {
    * the bearer — not from a query param, not from a header.
    */
   app.get("/app/projects", async (c) => {
-    const orgId = getAuthenticatedOrg(c, dashboardKeys)
+    const orgId = await authenticateDashboard(c, dashboardKeys, apiKeyStore)
     if (!orgId) {
       return c.json({ error: "unauthorized" }, 401)
     }
@@ -367,7 +455,7 @@ export function createApp(deps: AppDeps) {
    * leak from an empty result.
    */
   app.get("/app/projects/:projectId/traces", async (c) => {
-    const orgId = getAuthenticatedOrg(c, dashboardKeys)
+    const orgId = await authenticateDashboard(c, dashboardKeys, apiKeyStore)
     if (!orgId) {
       return c.json({ error: "unauthorized" }, 401)
     }
@@ -392,7 +480,7 @@ export function createApp(deps: AppDeps) {
    */
   app.get("/app/trace/:id", async (c) => {
     const id = c.req.param("id")
-    const orgId = getAuthenticatedOrg(c, dashboardKeys)
+    const orgId = await authenticateDashboard(c, dashboardKeys, apiKeyStore)
     if (!orgId) {
       return c.json({ error: "unauthorized" }, 401)
     }
@@ -414,6 +502,117 @@ export function createApp(deps: AppDeps) {
     })
   })
 
+  // ==========================================================
+  //  /app/keys — mint / list / revoke admin surface (Slice 5).
+  //
+  //  Gated strictly on a valid `epk_priv_` API key. A dashboard-only
+  //  `epk_dash_` session cannot mint new keys: the priv-key tier is the
+  //  "I can rotate our SDK keys" tier, separately guardable by the operator.
+  //  We reuse `authenticateDashboard()` but then insist on the strict priv
+  //  shape, so legacy `epk_dash_` bootstrap keys 401 here on purpose.
+  // ==========================================================
+
+  /**
+   * Shared priv-only gate. Returns `{ orgId }` on success, or a
+   * ready-to-return 401 Response when the bearer is missing / malformed /
+   * revoked / a non-priv token. Keeping the reject path uniform prevents
+   * accidental drift between the three routes below.
+   */
+  const requirePrivKey = async (c: Context): Promise<
+    { kind: "ok"; orgId: string } | { kind: "reject"; response: Response }
+  > => {
+    const auth = c.req.header("Authorization")
+    if (!auth || !auth.startsWith("Bearer ")) {
+      return { kind: "reject", response: c.json({ error: "unauthorized" }, 401) }
+    }
+    const raw = auth.slice("Bearer ".length).trim()
+    if (!raw.startsWith("epk_priv_")) {
+      return { kind: "reject", response: c.json({ error: "unauthorized" }, 401) }
+    }
+    const row = await apiKeyStore.verify(raw)
+    if (!row || row.keyType !== "priv") {
+      return { kind: "reject", response: c.json({ error: "unauthorized" }, 401) }
+    }
+    return { kind: "ok", orgId: row.orgId }
+  }
+
+  /**
+   * POST /app/keys — mint a new key in the caller's org.
+   *
+   * Body: `{ keyType: "pub" | "priv", name: string }`. We intentionally do
+   * NOT accept `orgId` in the body — the orgId comes from the authenticating
+   * priv key. Otherwise a compromised key could mint inside another org.
+   *
+   * Response (201): `{ row: ApiKeyRow, rawToken: string }`. The rawToken is
+   * returned ONCE; we never store it in the clear, so there is no way to
+   * retrieve it later. Operators who lose it must revoke and mint again.
+   */
+  app.post("/app/keys", async (c) => {
+    const gate = await requirePrivKey(c)
+    if (gate.kind === "reject") return gate.response
+    let body: { keyType?: unknown; name?: unknown }
+    try {
+      body = (await c.req.json()) as typeof body
+    } catch {
+      return c.json({ error: "invalid json" }, 400)
+    }
+    if (body.keyType !== "pub" && body.keyType !== "priv") {
+      return c.json({ error: "keyType must be 'pub' or 'priv'" }, 400)
+    }
+    if (typeof body.name !== "string" || body.name.trim() === "") {
+      return c.json({ error: "name must be a non-empty string" }, 400)
+    }
+    const minted = await apiKeyStore.mint(gate.orgId, body.keyType as KeyType, body.name.trim())
+    return c.json({ row: minted.row, rawToken: minted.rawToken }, 201)
+  })
+
+  /**
+   * GET /app/keys — list metadata for the caller's org.
+   *
+   * Metadata only — we MUST never return `keyHash` or anything that could
+   * be used to reconstruct a raw token. The store interface guarantees this
+   * by typing the list return as `ApiKeyRow[]` (no hash field).
+   */
+  app.get("/app/keys", async (c) => {
+    const gate = await requirePrivKey(c)
+    if (gate.kind === "reject") return gate.response
+    const rows = await apiKeyStore.list(gate.orgId)
+    return c.json({ keys: rows })
+  })
+
+  /**
+   * DELETE /app/keys/:id — soft-revoke a key in the caller's org.
+   *
+   * Returns 204 on success, 404 if the id doesn't belong to this org OR is
+   * already revoked OR doesn't exist. We collapse "not yours" and "not
+   * found" to the same 404 — a priv-auth'd operator poking at a competitor's
+   * short-id should get no tell.
+   *
+   * Revoke is eventually-consistent across replicas only to the extent of
+   * argon2 cost; the row is updated atomically, and `verify()` re-reads
+   * `revoked_at` on every call.
+   */
+  app.delete("/app/keys/:id", async (c) => {
+    const gate = await requirePrivKey(c)
+    if (gate.kind === "reject") return gate.response
+    const id = c.req.param("id")
+    // Cross-org guard: fetch the row first, confirm it belongs to the caller.
+    // Without this, `epk_priv_` for org_acme could revoke `epk_priv_` for
+    // org_competitor by guessing a 10-hex id. Unlikely-to-land with 40 bits
+    // of id space, but "unlikely" isn't "impossible".
+    const rows = await apiKeyStore.list(gate.orgId)
+    const target = rows.find((r) => r.id === id)
+    if (!target) {
+      return c.json({ error: "not found" }, 404)
+    }
+    const revoked = await apiKeyStore.revoke(id)
+    if (!revoked) {
+      // Already revoked — same response as "not found" on purpose.
+      return c.json({ error: "not found" }, 404)
+    }
+    return c.body(null, 204)
+  })
+
   return app
 }
 
@@ -432,7 +631,9 @@ export function createApp(deps: AppDeps) {
 export function makeMemoryDeps(
   shareTokenSecret: string,
   dashboardKeys: Map<string, string> = testDashboardKeys(),
-  overrides: Partial<Pick<AppDeps, "rateLimiter" | "metrics" | "maxIngestBytes" | "now">> = {},
+  overrides: Partial<
+    Pick<AppDeps, "rateLimiter" | "metrics" | "maxIngestBytes" | "now" | "apiKeyStore">
+  > = {},
 ): AppDeps {
   const store = new InMemorySpanStore()
   const views = new SpanViews(store)
@@ -448,11 +649,13 @@ export function makeMemoryDeps(
   const metrics = overrides.metrics ?? new Metrics()
   const maxIngestBytes = overrides.maxIngestBytes ?? DEFAULT_INGEST_MAX_BYTES
   const now = overrides.now ?? (() => new Date())
+  const apiKeyStore = overrides.apiKeyStore ?? new InMemoryApiKeyStore()
   return {
     store,
     views,
     signer,
     dashboardKeys,
+    apiKeyStore,
     rateLimiter,
     metrics,
     maxIngestBytes,
@@ -475,6 +678,13 @@ export async function makeDefaultDeps(config: {
   maxIngestBytes?: number
   spansPerSec?: number
   bytesPerDay?: number
+  /**
+   * Raw `BOOTSTRAP_API_KEYS` env var (JSON). Seeded into the ApiKeyStore at
+   * boot. Lets the Day-1 operator ship a known priv key so they can hit
+   * `/app/keys` before any keys exist in the DB. After boot the `/app/keys`
+   * admin endpoint is the only mint surface.
+   */
+  bootstrapApiKeysJson?: string | undefined
 }): Promise<AppDeps> {
   const signer = new HmacShareTokenSigner(config.shareTokenSecret)
   const metrics = new Metrics()
@@ -485,6 +695,8 @@ export async function makeDefaultDeps(config: {
   const maxIngestBytes = config.maxIngestBytes ?? DEFAULT_INGEST_MAX_BYTES
   const now = () => new Date()
 
+  let apiKeyStore: ApiKeyStore
+  let deps: AppDeps
   if (config.databaseUrl) {
     const sql = createSQL(config.databaseUrl)
     const applied = await runMigrations(sql)
@@ -492,24 +704,40 @@ export async function makeDefaultDeps(config: {
       console.log(`[migrate] applied: ${applied.join(", ")}`)
     }
     const store = new PgSpanStore(sql)
-    return {
+    apiKeyStore = new PgApiKeyStore(sql)
+    deps = {
       store,
       views: new SpanViews(store),
       signer,
       dashboardKeys: config.dashboardKeys,
+      apiKeyStore,
       rateLimiter,
       metrics,
       maxIngestBytes,
       now,
     }
+  } else {
+    console.warn("[server] DATABASE_URL not set — using in-memory store (data lost on restart)")
+    apiKeyStore = new InMemoryApiKeyStore()
+    deps = makeMemoryDeps(config.shareTokenSecret, config.dashboardKeys, {
+      rateLimiter,
+      metrics,
+      maxIngestBytes,
+      now,
+      apiKeyStore,
+    })
   }
-  console.warn("[server] DATABASE_URL not set — using in-memory store (data lost on restart)")
-  return makeMemoryDeps(config.shareTokenSecret, config.dashboardKeys, {
-    rateLimiter,
-    metrics,
-    maxIngestBytes,
-    now,
-  })
+
+  // Seed the store from BOOTSTRAP_API_KEYS. Idempotent across restarts
+  // because `seed()` is a no-op when the row already exists.
+  const bootstrapEntries = parseBootstrapKeys(config.bootstrapApiKeysJson)
+  if (bootstrapEntries.length > 0) {
+    for (const entry of bootstrapEntries) {
+      await apiKeyStore.seed(entry.rawToken, entry.orgId, entry.keyType, entry.name)
+    }
+    console.log(`[bootstrap] seeded ${bootstrapEntries.length} API key(s) from BOOTSTRAP_API_KEYS`)
+  }
+  return deps
 }
 
 function requireShareSecret(): string {
@@ -523,15 +751,18 @@ function requireShareSecret(): string {
   return s
 }
 
-function requireDashboardKeys(): Map<string, string> {
-  const keys = parseDashboardKeys(process.env.DASHBOARD_KEYS)
-  if (keys.size === 0) {
-    throw new Error(
-      'DASHBOARD_KEYS env var must be a JSON object mapping bearer keys to orgIds. ' +
-        'Example: DASHBOARD_KEYS=\'{"epk_dash_acme_<32-hex>":"org_acme"}\'',
-    )
-  }
-  return keys
+/**
+ * Load optional dashboard keys from env. Unlike pre-Slice-5, this is NOT
+ * fatal if unset: `epk_priv_` keys minted via `/app/keys` authenticate the
+ * dashboard too, so an operator can boot with only `BOOTSTRAP_API_KEYS` and
+ * skip the legacy `DASHBOARD_KEYS` surface entirely.
+ *
+ * If BOTH are unset we warn loudly — boots like that cannot auth any
+ * dashboard call; the operator probably made a mistake and won't realize
+ * it until the first 401 rolls in. Warn, don't crash.
+ */
+function loadDashboardKeys(): Map<string, string> {
+  return parseDashboardKeys(process.env.DASHBOARD_KEYS)
 }
 
 /**
@@ -573,13 +804,23 @@ if (import.meta.main) {
   const bytesPerDay = envInt("INGEST_BYTES_PER_DAY", DEFAULT_BYTES_PER_DAY)
   const retentionDays = envInt("RETENTION_DAYS", DEFAULT_RETENTION_DAYS)
 
+  const dashboardKeys = loadDashboardKeys()
+  const bootstrapApiKeysJson = process.env.BOOTSTRAP_API_KEYS
+  if (dashboardKeys.size === 0 && !bootstrapApiKeysJson) {
+    console.warn(
+      "[server] neither DASHBOARD_KEYS nor BOOTSTRAP_API_KEYS is set — " +
+        "no dashboard bearer will authenticate. Mint an epk_priv_ key out-of-band " +
+        "or set one of these envs.",
+    )
+  }
   const deps = await makeDefaultDeps({
     shareTokenSecret: requireShareSecret(),
-    dashboardKeys: requireDashboardKeys(),
+    dashboardKeys,
     databaseUrl: process.env.DATABASE_URL,
     maxIngestBytes,
     spansPerSec,
     bytesPerDay,
+    bootstrapApiKeysJson,
   })
   const app = createApp(deps)
   const port = Number(process.env.PORT ?? 3000)

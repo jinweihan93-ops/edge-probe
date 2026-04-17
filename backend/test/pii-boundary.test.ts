@@ -326,8 +326,11 @@ describe("POST /app/trace/:id/share: auth'd mint endpoint", () => {
 })
 
 describe("POST /ingest smoke", () => {
-  test("accepts valid trace+spans with Bearer epk_pub_ key", async () => {
-    const app = createApp(freshDeps())
+  test("accepts valid trace+spans with a minted epk_pub_ key", async () => {
+    const deps = freshDeps()
+    // Slice 5: ingest auth is now a real hashed-key lookup. Mint one first.
+    const { rawToken } = await deps.apiKeyStore.mint("org_acme", "pub", "test-pub")
+    const app = createApp(deps)
     const payload = {
       trace: {
         id: "trace_e2e",
@@ -345,7 +348,7 @@ describe("POST /ingest smoke", () => {
     const res = await app.request("/ingest", {
       method: "POST",
       headers: {
-        "Authorization": "Bearer epk_pub_test_key",
+        "Authorization": `Bearer ${rawToken}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify(payload),
@@ -364,11 +367,30 @@ describe("POST /ingest smoke", () => {
   })
 
   test("rejects non-public key prefix with 401", async () => {
+    const deps = freshDeps()
+    // Even a *valid* priv key does not authorize /ingest.
+    const { rawToken: privToken } = await deps.apiKeyStore.mint("org_acme", "priv", "demo")
+    const app = createApp(deps)
+    const res = await app.request("/ingest", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${privToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ trace: { id: "x" }, spans: [] }),
+    })
+    expect(res.status).toBe(401)
+  })
+
+  test("rejects a pub-prefixed but unrecognized token with 401 (Slice 5 lookup)", async () => {
+    // Shape-valid token that was never seeded: argon2 verify fails → 401.
+    // Pre-Slice-5 this would have landed as 400 once we parsed the payload;
+    // now we reject before that.
     const app = createApp(freshDeps())
     const res = await app.request("/ingest", {
       method: "POST",
       headers: {
-        "Authorization": "Bearer epk_priv_should_not_work_here",
+        "Authorization": "Bearer epk_pub_0123456789_abcdef0123456789abcdef0123456789",
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ trace: { id: "x" }, spans: [] }),
@@ -377,15 +399,91 @@ describe("POST /ingest smoke", () => {
   })
 
   test("rejects malformed payload with 400", async () => {
-    const app = createApp(freshDeps())
+    const deps = freshDeps()
+    const { rawToken } = await deps.apiKeyStore.mint("org_acme", "pub", "demo")
+    const app = createApp(deps)
     const res = await app.request("/ingest", {
       method: "POST",
       headers: {
-        "Authorization": "Bearer epk_pub_test",
+        "Authorization": `Bearer ${rawToken}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ not_a_trace: true }),
     })
     expect(res.status).toBe(400)
+  })
+
+  test("Slice 5: payload.orgId must equal the key's org or 401", async () => {
+    const deps = freshDeps()
+    const { rawToken } = await deps.apiKeyStore.mint("org_acme", "pub", "demo")
+    const app = createApp(deps)
+    // Valid pub key for org_acme, but payload claims org_competitor.
+    // Must 401 — a compromised public key cannot scribble into another org.
+    const payload = {
+      trace: {
+        id: "trace_cross",
+        orgId: "org_competitor",
+        projectId: "p",
+        sessionId: null,
+        startedAt: "2026-04-15T12:00:00Z",
+        endedAt: null,
+        device: {},
+        attributes: {},
+        sensitive: false,
+      },
+      spans: [],
+    }
+    const res = await app.request("/ingest", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${rawToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    })
+    expect(res.status).toBe(401)
+  })
+
+  test("Slice 5: revoked pub key no longer authorizes /ingest", async () => {
+    const deps = freshDeps()
+    const { rawToken, row } = await deps.apiKeyStore.mint("org_acme", "pub", "demo")
+    const app = createApp(deps)
+    const payload = {
+      trace: {
+        id: "trace_pre_revoke",
+        orgId: "org_acme",
+        projectId: "p",
+        sessionId: null,
+        startedAt: "2026-04-15T12:00:00Z",
+        endedAt: null,
+        device: {},
+        attributes: {},
+        sensitive: false,
+      },
+      spans: [],
+    }
+    // Pre-revoke, accepted.
+    const okRes = await app.request("/ingest", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${rawToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    })
+    expect(okRes.status).toBe(202)
+
+    await deps.apiKeyStore.revoke(row.id)
+
+    const afterRes = await app.request("/ingest", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${rawToken}`,
+        "Content-Type": "application/json",
+      },
+      // Use a different trace id so dedup doesn't muddy the test.
+      body: JSON.stringify({ ...payload, trace: { ...payload.trace, id: "trace_post_revoke" } }),
+    })
+    expect(afterRes.status).toBe(401)
   })
 })
