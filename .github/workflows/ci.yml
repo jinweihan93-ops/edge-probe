@@ -139,6 +139,61 @@ jobs:
             --org org_acme --project proj_ci \
             --dry-run
 
+  # ──────────────────────────────────────────────────────────────────────
+  # Critical Paths — the six ship-gating invariants from docs/TEST-PLAN.md.
+  #
+  # These run in their OWN jobs (not buried inside `ios`/`backend`) so a
+  # reviewer glancing at PR status sees them as discrete green/red signals.
+  # They're fast — the backend suite is ~150ms, the iOS one is ~3ms — so a
+  # regression here surfaces before the broader suites finish installing.
+  # Both feed into `required` as first-class dependencies.
+  #
+  # Canonical file locations (kept in lockstep):
+  #   - backend/test/critical-paths.test.ts     (invariants #1, #2, #3)
+  #   - ios/Tests/EdgeProbeTests/CriticalPathsTests.swift  (#4, #5, #6)
+  # ──────────────────────────────────────────────────────────────────────
+  critical-paths-backend:
+    name: Critical Paths — backend (invariants #1–#3)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install
+        run: bun install --frozen-lockfile
+      - name: Run critical-paths suite only
+        # Single-file gate — if this fails, the branch cannot ship.
+        run: bun test test/critical-paths.test.ts
+
+  critical-paths-ios:
+    name: Critical Paths — iOS (invariants #4–#6)
+    runs-on: macos-14
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: ios
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.0.app
+      - name: Cache SwiftPM artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ios/.build
+            ~/Library/Caches/org.swift.swiftpm
+          key: swiftpm-critical-${{ runner.os }}-${{ hashFiles('ios/Package.swift') }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-
+      - name: Run CriticalPathsTests only
+        run: swift test --filter CriticalPathsTests
+
   e2e:
     name: End-to-end — scripts/e2e.sh
     runs-on: ubuntu-latest
@@ -170,19 +225,28 @@ jobs:
   required:
     name: All checks
     runs-on: ubuntu-latest
-    needs: [ios, backend, web, action, e2e]
+    needs:
+      - ios
+      - backend
+      - web
+      - action
+      - e2e
+      - critical-paths-backend
+      - critical-paths-ios
     if: always()
     steps:
       - name: Verify required jobs succeeded
         run: |
           failed=0
-          for job in ios backend web action e2e; do
+          for job in ios backend web action e2e critical-paths-backend critical-paths-ios; do
             case "$job" in
-              ios)     result="${{ needs.ios.result }}" ;;
-              backend) result="${{ needs.backend.result }}" ;;
-              web)     result="${{ needs.web.result }}" ;;
-              action)  result="${{ needs.action.result }}" ;;
-              e2e)     result="${{ needs.e2e.result }}" ;;
+              ios)                     result="${{ needs.ios.result }}" ;;
+              backend)                 result="${{ needs.backend.result }}" ;;
+              web)                     result="${{ needs.web.result }}" ;;
+              action)                  result="${{ needs.action.result }}" ;;
+              e2e)                     result="${{ needs.e2e.result }}" ;;
+              critical-paths-backend)  result="${{ needs['critical-paths-backend'].result }}" ;;
+              critical-paths-ios)      result="${{ needs['critical-paths-ios'].result }}" ;;
             esac
             echo "  $job: $result"
             if [ "$result" != "success" ]; then failed=1; fi
