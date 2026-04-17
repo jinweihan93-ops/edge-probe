@@ -9,6 +9,13 @@ options:
 # SPM deps: the local EdgeProbe SDK by relative path + MLX-Swift-Examples
 # from GitHub. mlx-swift-examples re-exports MLX/MLXNN/MLXLLM/MLXLMCommon,
 # so depending on it transitively pulls everything we need for on-device Llama.
+#
+# swift-transformers is also pulled in transitively by mlx-swift-examples, but
+# we declare it explicitly here so the simulator-only CoreML LLM path (opt-in
+# via `-EDGEPROBE_SIM_COREML`) can `import Hub` and `import Tokenizers`
+# without depending on mlx-swift-examples's re-export surface (which is
+# limited to the `Transformers` umbrella product). The version constraint
+# matches what mlx-swift-examples resolves to; SPM will dedupe.
 packages:
   EdgeProbe:
     path: ..
@@ -18,6 +25,18 @@ packages:
     # surface (LLMRegistry names, processor prepare shape) has evolved. Update
     # this pin if you want to track HEAD; the README notes what to patch.
     from: "2.21.0"
+  swift-transformers:
+    url: https://github.com/huggingface/swift-transformers
+    # 1.0.0 is the first stable release and what mlx-swift-examples pins to.
+    # The simulator-only CoreML LLM path (ModelHub + LLMService, opt-in via
+    # `-EDGEPROBE_SIM_COREML`) uses `HubApi.snapshot` for weight download
+    # and `AutoTokenizer.from(modelFolder:)` + chat-template apply for
+    # tokenization. The inference loop itself drives `MLModel` + `MLState`
+    # directly — swift-transformers' `LanguageModel` wrapper hard-codes
+    # camelCase CoreML input names and doesn't match the finnvoorhees
+    # SmolLM2 export (snake_case `input_ids` / `causal_mask`), so we bypass
+    # it. iOS 18 runtime guard is applied at the call sites.
+    from: "1.0.0"
 
 targets:
   VoiceProbe:
@@ -74,3 +93,16 @@ targets:
         product: MLXLLM
       - package: mlx-swift-examples
         product: MLXLMCommon
+      # CoreML LLM path (simulator, opt-in). `Transformers` bundles
+      # Tokenizers + Generation + Models; `Hub` is a separate product for
+      # HubApi snapshot download + local cache management. Device builds
+      # still pay the link cost for these, but the code behind them is
+      # all gated by `#if targetEnvironment(simulator)` so nothing
+      # executes on device. Within sim, the path is further gated by the
+      # `-EDGEPROBE_SIM_COREML` launch arg; default sim builds use a
+      # stub that doesn't touch either symbol. See README VoiceProbe
+      # section for why the default is the stub.
+      - package: swift-transformers
+        product: Transformers
+      - package: swift-transformers
+        product: Hub

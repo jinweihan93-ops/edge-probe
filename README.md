@@ -56,3 +56,105 @@ That is the whole pitch. The SDK captures the span, exports it to the backend, a
 4. Main thread never blocked by SDK
 5. SDK drops oldest on buffer overflow, counter emitted as metric
 6. `EdgeProbe.start()` is idempotent
+
+## VoiceProbe reference demo (`ios/DemoApp`)
+
+VoiceProbe is the "does the SDK trace a real on-device turn" demo. It
+runs a full **ASR → LLM → TTS** voice loop with EdgeProbe wrapping each
+stage. The LLM backend has three paths:
+
+| Environment                          | Backend       | Model                                      | Size    | Loader                       |
+|--------------------------------------|---------------|--------------------------------------------|---------|------------------------------|
+| Device                               | MLX-Swift     | `mlx-community/Llama-3.2-1B-Instruct-4bit` | ~700 MB | `LLMModelFactory` (HF Hub)   |
+| Simulator, default                   | Stub          | deterministic canned reply                 | 0       | in-process, no network       |
+| Simulator, `-EDGEPROBE_SIM_COREML`   | CoreML        | `finnvoorhees/coreml-SmolLM2-360M-Instruct-4bit` + tokenizer from `HuggingFaceTB/SmolLM2-360M-Instruct` | ~210 MB | `MLModel` + `MLState` via `ModelHub.swift` |
+
+**Why the split?** MLX requires Metal-for-compute and the iOS simulator
+doesn't expose it — `MLX.GPU` abort()s inside `mlx::core::metal::Device`
+on load. So simulator cannot use the same engine as device.
+
+We originally shipped a CoreML SmolLM2 path on simulator so CI could
+baseline latency against a real small model. It now does not run
+because of a simulator/CoreML bug (see "zero-logit failure" below), so
+the simulator default is a stub that still exercises the SDK's trace
+pipeline with plausible (~600ms) synthetic LLM latency. The real CoreML
+code is still in the tree and gated behind `-EDGEPROBE_SIM_COREML` so
+future reinvestigation is a launch-arg away, not a revert.
+
+**First launch downloads ~700 MB (device) or ~210 MB (sim with
+`-EDGEPROBE_SIM_COREML`) from HuggingFace Hub.** The default sim path
+downloads nothing. The progress chip ("Downloading 42%") is bound to
+the actual byte stream on the real paths; subsequent launches hit the
+on-device cache.
+
+### Simulator CoreML zero-logit failure
+
+Confirmed on Xcode 26 / iOS 26 simulator / `finnvoorhees/coreml-SmolLM2-360M-Instruct-4bit`
+(2026-04-17):
+
+1. **`.cpuAndGPU` / `.all` compute units fail to load** with
+   `com.apple.CoreML` error `-14` ("Failed to build the model execution
+   plan"). The simulator's GPU backend can't codegen iOS-18 stateful
+   ops (`Ios18.readState` / `Ios18.writeState` in `model.mil`).
+2. **`.cpuOnly` loads fine but produces all-zero logits.** First
+   prediction returns a `[1, 38, 49152]` fp16 tensor where every
+   element is exactly `0.0` — verified via both `dataPointer`-bound
+   `Float16` access and `NSNumber` subscript. Strong signal that the
+   simulator's CPU backend silently no-ops the
+   `constexpr_blockwise_shift_scale` dequantization for int4 weights,
+   so every matmul multiplies by zero and the downstream logits land
+   on the zero-initialized output buffer.
+3. **Not a read-side bug.** Pointer access and subscript access agree,
+   the output shape/strides/dtype are correct (`[1, seqLen, 49152]`,
+   fp16, contiguous), and the model description reports exactly one
+   output (`logits`) with two inputs (`causal_mask`, `input_ids`).
+
+`generateSimulatorCoreML` now detects all-zero logits on the first
+prediction and throws `LLMError.inferenceFailed` with a message
+pointing back here — rather than spinning out 128 × token-id-0 until
+the budget cap and handing the user an empty string.
+
+The code is left in `LLMService.swift` (also `ModelHub.swift`) so:
+
+- If Apple ships a simulator-CPU fix, flipping
+  `-EDGEPROBE_SIM_COREML` is a one-step re-test.
+- If someone wants to try a non-int4 or non-stateful CoreML LLM that
+  sidesteps both bugs, the swap points are `Repo.coremlModel` /
+  `Repo.tokenizerSource` / `mlmodelcName` in `ModelHub.swift`. If the
+  replacement uses camelCase input names (matching swift-transformers'
+  `LanguageModel` conventions), you can revert to
+  `LanguageModel.loadCompiled` and drop the custom `MLModel +
+  MLState` driver.
+
+### Simulator CoreML caveats (still true when the path is re-enabled)
+
+- **Compute policy must be `.cpuOnly`.** Non-negotiable on simulator
+  until the GPU stateful-op codegen is fixed.
+- **The mlmodelc uses snake_case input names** (`input_ids`,
+  `causal_mask`) because it was converted straight from PyTorch with
+  default `coremltools` naming. swift-transformers' `LanguageModel`
+  wrapper hard-codes camelCase (`inputIds`, `causalMask`) and
+  fatalErrors on mismatch. The opt-in path therefore drives `MLModel`
+  + `MLState` directly and only uses `Tokenizers` for chat template /
+  encode / decode.
+- **`Float16` mask values: use `-65504` (fp16 min), not `-.infinity`.**
+  Some CoreML kernels turn `-inf + finite` into NaN, poisoning the
+  downstream softmax. We don't use blocked-mask entries today (mask is
+  all-zeros — see `predictNextToken` for why) but if you reintroduce
+  upper-triangular causal masking this is the value to reach for.
+
+### Dev ergonomics
+
+Launch args exposed by the demo app, all off by default:
+
+- `-EDGEPROBE_AUTOLOAD 1` — fires `llm.load()` on `.task` entry in
+  parallel with the mic/speech permission dialogs. Needed because
+  simulator can't accept synthetic taps without Input Monitoring TCC.
+- `-EDGEPROBE_AUTOGENERATE "<prompt>"` — after autoload succeeds, runs
+  one `llm.generate(prompt)` and prints the reply + elapsed ms to
+  stdout. Use with `xcrun simctl launch --console-pty` for CI smoke
+  tests and local benchmarking.
+- `-EDGEPROBE_SIM_COREML` — simulator only. Opts into the real CoreML
+  LLM path instead of the default stub. Currently surfaces the
+  zero-logit failure as a thrown error on the first generate; useful
+  for verifying Apple-side fixes or swapping in a different model.

@@ -1,4 +1,7 @@
 import SwiftUI
+import OSLog
+
+private let uiLog = Logger(subsystem: "dev.edgeprobe.demo.VoiceProbe", category: "ContentView")
 
 /// The whole app UI. One screen:
 ///   • Model status chip ("Load model" → progress → "Ready")
@@ -49,7 +52,59 @@ struct ContentView: View {
             .foregroundStyle(.white)
         }
         .task {
+            // Dev ergonomic: `-EDGEPROBE_AUTOLOAD 1` on the launch arg list
+            // kicks off load() immediately, in parallel with the
+            // permissions prompt. We use this for:
+            //   • Simulator smoke tests (Claude/CI doesn't have a reliable
+            //     way to post synthetic taps into the Simulator window —
+            //     CGEventPost without Input Monitoring entitlement gets
+            //     filtered, so the model-load path is otherwise
+            //     unreachable without a launch-arg hook).
+            //   • Faster dev loop when you're iterating on the model.
+            // Fires *before* the await on permissions so it can run
+            // concurrently with the mic/speech dialogs — we don't need
+            // either permission to download weights or load a CoreML
+            // model. Not a user-facing feature. Leave the button path
+            // intact so normal users still see a "start when ready"
+            // affordance.
+            let args = ProcessInfo.processInfo.arguments
+            uiLog.info("launch args: \(args.joined(separator: " "), privacy: .public)")
+            if args.contains("-EDGEPROBE_AUTOLOAD") {
+                uiLog.info("auto-load flag set, firing llm.load()")
+                Task {
+                    do {
+                        try await llm.load()
+
+                        // Dev-only: `-EDGEPROBE_AUTOGENERATE "<prompt>"`
+                        // runs one synthetic turn through the LLM after
+                        // load completes, so we can CI-verify generation
+                        // without needing to tap-and-hold the mic (which
+                        // is blocked on macOS Input Monitoring TCC in
+                        // sim). Prints the generated text + elapsed ms
+                        // to stdout so `xcrun simctl launch --console-pty`
+                        // can assert on it — OSLog isn't visible through
+                        // the pty capture, so `print` is load-bearing
+                        // here, not debug residue.
+                        if let idx = args.firstIndex(of: "-EDGEPROBE_AUTOGENERATE"),
+                           idx + 1 < args.count {
+                            let prompt = args[idx + 1]
+                            print("[VP] AUTOGENERATE prompt=\(prompt.debugDescription)")
+                            let t0 = Date()
+                            do {
+                                let reply = try await llm.generate(prompt)
+                                let ms = Int(Date().timeIntervalSince(t0) * 1000)
+                                print("[VP] AUTOGENERATE reply (\(ms)ms): \(reply.debugDescription)")
+                            } catch {
+                                print("[VP] AUTOGENERATE threw: \(error)")
+                            }
+                        }
+                    } catch {
+                        print("[VP] AUTOLOAD llm.load() threw: \(error)")
+                    }
+                }
+            }
             permissionGranted = await ASRService.requestPermissions()
+            uiLog.info("permissions granted: \(permissionGranted, privacy: .public)")
         }
     }
 
