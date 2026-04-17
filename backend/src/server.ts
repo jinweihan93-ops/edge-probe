@@ -1,6 +1,14 @@
 import { Hono } from "hono"
 import type { Context } from "hono"
-import { InMemorySpanStore, SpanViews, type SpanStore, type Trace, type StoredSpan } from "./views.ts"
+import {
+  InMemorySpanStore,
+  SpanViews,
+  toPublicTrace,
+  ContentProjectionError,
+  type SpanStore,
+  type Trace,
+  type StoredSpan,
+} from "./views.ts"
 import { PgSpanStore } from "./pgSpanStore.ts"
 import { createSQL } from "./db.ts"
 import { runMigrations } from "./migrate.ts"
@@ -355,17 +363,24 @@ export function createApp(deps: AppDeps) {
       return c.json({ error: "not found" }, 404)
     }
 
-    const spans = await views.public_forTrace(trace.id)
-    return c.json({
-      trace: {
-        id: trace.id,
-        startedAt: trace.startedAt,
-        endedAt: trace.endedAt,
-        device: trace.device,
-        attributes: trace.attributes,
-      },
-      spans,
-    })
+    // Slice 6: content-projection tripwire. If stripContentAttributes ever
+    // misses a content-shaped key, views.ts throws ContentProjectionError.
+    // Fail closed: a 404 is identical to the other failure modes on this
+    // route, so an attacker cannot tell a projection bug apart from a bad
+    // token. Log-worthy internally; outwardly silent.
+    try {
+      const publicTrace = toPublicTrace(trace)
+      const spans = await views.public_forTrace(trace.id)
+      return c.json({ trace: publicTrace, spans })
+    } catch (err) {
+      if (err instanceof ContentProjectionError) {
+        console.error(
+          `[edgeprobe] content projection guard tripped for trace ${trace.id}: key=${err.offendingKey}`,
+        )
+        return c.json({ error: "not found" }, 404)
+      }
+      throw err
+    }
   })
 
   /**
@@ -414,7 +429,23 @@ export function createApp(deps: AppDeps) {
       return fallback()
     }
 
-    const spans = await views.public_forTrace(trace.id)
+    // Slice 6: same projection tripwire as /r/:token. The OG card only uses
+    // timing fields + gen_ai.request.model today, but render-then-PNG runs
+    // the spans through the same public projection — if it throws, return
+    // the branded fallback rather than the unbranded renderOgPng output on
+    // possibly-tainted data.
+    let spans
+    try {
+      spans = await views.public_forTrace(trace.id)
+    } catch (err) {
+      if (err instanceof ContentProjectionError) {
+        console.error(
+          `[edgeprobe] content projection guard tripped for OG ${trace.id}: key=${err.offendingKey}`,
+        )
+        return fallback()
+      }
+      throw err
+    }
     const png = renderOgPng({ trace, spans })
     return c.body(new Uint8Array(png), 200, {
       "Content-Type": "image/png",

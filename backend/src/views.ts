@@ -61,29 +61,108 @@ export interface Trace {
 }
 
 // ----- Content-stripping (defense in depth) -----
+//
+// Two independent layers:
+//   1. `stripContentAttributes` — conservative strip driven by a denylist
+//      of known OpenTelemetry / OpenLLMetry / common-vendor content keys,
+//      plus a segment-match for generic content nouns.
+//   2. `assertNoContentLeak` — a tripwire run AFTER the strip, using a
+//      deliberately-independent regex. If the strip ever misses a key that
+//      the tripwire flags, we throw `ContentProjectionError` rather than
+//      render — fail-closed. The two implementations are kept out of sync
+//      on purpose: a bug in one is meant to be caught by the other.
 
+/** Exact attribute keys that are content and must never leave the private view. */
 const CONTENT_ATTR_DENYLIST = new Set([
   "content.prompt",
   "content.completion",
   "content.transcript",
   "gen_ai.prompt",
   "gen_ai.completion",
+  "gen_ai.messages",
+  "gen_ai.response.messages",
+  "gen_ai.response.text",
+  "llm.prompt",
+  "llm.completion",
+  "llm.messages",
   "user.input",
   "user.output",
 ])
 
-function stripContentAttributes(attrs: Record<string, unknown>): Record<string, unknown> {
+/**
+ * Dot-segment words that indicate content regardless of namespace. Matched
+ * as whole segments (not substrings) so benign keys like `completions_served`
+ * or `prompted_at` are not mis-stripped.
+ */
+const CONTENT_SEGMENT_WORDS = new Set([
+  "prompt",
+  "completion",
+  "transcript",
+  "message",
+  "messages",
+  "generated_text",
+  "response_text",
+  "input_text",
+  "output_text",
+])
+
+export function keyLooksLikeContent(key: string): boolean {
+  const lower = key.toLowerCase()
+  if (CONTENT_ATTR_DENYLIST.has(lower)) return true
+  if (lower.startsWith("content.")) return true
+  for (const seg of lower.split(".")) {
+    if (CONTENT_SEGMENT_WORDS.has(seg)) return true
+  }
+  return false
+}
+
+export function stripContentAttributes(
+  attrs: Record<string, unknown>,
+): Record<string, unknown> {
   const out: Record<string, unknown> = {}
   for (const [k, v] of Object.entries(attrs)) {
-    if (CONTENT_ATTR_DENYLIST.has(k)) continue
-    if (k.startsWith("content.")) continue
+    if (keyLooksLikeContent(k)) continue
     out[k] = v
   }
   return out
 }
 
-/** Projects a stored span down to the public shape. Throws if content would leak. */
+/**
+ * Thrown when the post-strip tripwire finds a content-shaped key that slipped
+ * past `stripContentAttributes`. In practice this should NEVER fire — the
+ * strip and the tripwire are implementations of the same rule. If it does
+ * fire, it means someone broke the strip and we refused to leak rather than
+ * silently render. Endpoints that catch this translate it to a 500 or skip
+ * the span; they do NOT render it anyway.
+ */
+export class ContentProjectionError extends Error {
+  constructor(public readonly offendingKey: string) {
+    super(`content-keyed attribute survived projection: ${offendingKey}`)
+    this.name = "ContentProjectionError"
+  }
+}
+
+/**
+ * Independent regex-driven fail-closed tripwire. Deliberately NOT sharing
+ * code with `stripContentAttributes` — if that function develops a bug,
+ * this one still catches the common shapes. Matches a whole dot-segment
+ * (or the full key) against the same vocabulary of content nouns.
+ */
+const CONTENT_TRIPWIRE_RE =
+  /(?:^|\.)(?:prompt|completion|transcript|messages?|generated_text|response_text|input_text|output_text)(?:\.|$)/i
+
+export function assertNoContentLeak(attrs: Record<string, unknown>): void {
+  for (const k of Object.keys(attrs)) {
+    if (CONTENT_TRIPWIRE_RE.test(k)) {
+      throw new ContentProjectionError(k)
+    }
+  }
+}
+
+/** Projects a stored span down to the public shape. Throws ContentProjectionError if content would leak. */
 function toPublicSpan(stored: StoredSpan): PublicSpan {
+  const stripped = stripContentAttributes(stored.attributes)
+  assertNoContentLeak(stripped)
   return {
     id: stored.id,
     traceId: stored.traceId,
@@ -94,7 +173,31 @@ function toPublicSpan(stored: StoredSpan): PublicSpan {
     endedAt: stored.endedAt,
     durationMs: stored.durationMs,
     status: stored.status,
-    attributes: stripContentAttributes(stored.attributes),
+    attributes: stripped,
+  }
+}
+
+/**
+ * Public projection of trace-level metadata for `/r/:token`. The SDK never
+ * populates trace attributes with content, but trace.attributes is a typed
+ * `Record<string, unknown>` — a future caller could put anything in it.
+ * Strip the same way we strip span attributes, for the same reason.
+ */
+export function toPublicTrace(trace: Trace): {
+  id: string
+  startedAt: string
+  endedAt: string | null
+  device: Record<string, unknown>
+  attributes: Record<string, unknown>
+} {
+  const stripped = stripContentAttributes(trace.attributes)
+  assertNoContentLeak(stripped)
+  return {
+    id: trace.id,
+    startedAt: trace.startedAt,
+    endedAt: trace.endedAt,
+    device: trace.device,
+    attributes: stripped,
   }
 }
 

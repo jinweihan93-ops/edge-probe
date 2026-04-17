@@ -162,6 +162,12 @@ public enum EdgeProbe {
     ///     is uploaded to the backend and visible in the authenticated dashboard.
     ///     Default is `false`. Opting in does NOT make the span visible on public
     ///     share URLs (Critical Path #3).
+    ///   - sensitive: When `true`, the resulting trace is marked `sensitive: true`
+    ///     server-side. Public share URLs (`/r/:token`) return 404 and OG unfurl
+    ///     renders the branded fallback, regardless of any share token that may
+    ///     be minted. The authenticated dashboard still displays it for the
+    ///     owning org. Use this for medical / legal / PII-heavy flows where
+    ///     even the structural timeline should be private. Default `false`.
     ///   - block: The work to measure.
     /// - Returns: Whatever `block` returns.
     @discardableResult
@@ -169,6 +175,7 @@ public enum EdgeProbe {
         _ kind: TraceKind,
         name: String? = nil,
         includeContent: Bool = false,
+        sensitive: Bool = false,
         _ block: () throws -> T
     ) rethrows -> T {
         let startInstant = Date()
@@ -197,7 +204,7 @@ public enum EdgeProbe {
                     endedAt: iso.string(from: endInstant),
                     device: currentDeviceAttributes(),
                     attributes: [:],
-                    sensitive: false
+                    sensitive: sensitive
                 )
                 let span = SpanData(
                     id: spanId,
