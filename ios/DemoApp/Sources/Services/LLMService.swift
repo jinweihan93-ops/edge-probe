@@ -338,16 +338,13 @@ final class LLMService: ObservableObject {
     /// plausible-looking range on the dashboard. Deterministic: same
     /// prompt in, same reply out, same elapsed time in ±jitter. That's
     /// the benchmark-friendly bit we keep even without a real model.
+    ///
+    /// The reply text itself is formatted by `SimulatorStubReply.text(for:)`
+    /// — pulled out of this function so `scripts/voiceprobe-stub-smoke.sh`
+    /// can exercise it without booting a simulator or linking MLX.
     private func generateSimulatorStub(_ prompt: String) async throws -> String {
         try await Task.sleep(nanoseconds: 600_000_000) // 600ms
-        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        let preview = trimmed.count > 60
-            ? String(trimmed.prefix(60)) + "…"
-            : trimmed
-        if preview.isEmpty {
-            return "Simulator stub — real on-device inference runs on a physical iPhone."
-        }
-        return "Got it: \"\(preview)\". (Simulator stub — real on-device inference runs on a physical iPhone.)"
+        return SimulatorStubReply.text(for: prompt)
     }
     #endif
 

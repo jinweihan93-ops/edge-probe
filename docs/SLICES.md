@@ -18,7 +18,7 @@ Follow-up work creates a new slice, not a rename.
 - [x] **Slice 7** — Six critical regression tests as an explicit named suite
 - [x] **Slice 8** — XCFramework build workflow on upstream tags
 - [x] **Slice 9** — Benchmark harness (Y1 OSS tool) — minimal first cut
-- [ ] **Slice 10** — VoiceProbe cleanup tail from Slice 0
+- [x] **Slice 10** — VoiceProbe cleanup tail from Slice 0
 
 ## Slice contracts
 

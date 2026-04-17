@@ -129,7 +129,16 @@ struct ContentView: View {
             if llm.isLoaded {
                 Text(llm.modelName).font(.caption).monospaced()
             } else if llm.loadProgress > 0 {
-                Text("Downloading \(Int(llm.loadProgress * 100))%")
+                // Different verb per path — the sim stub's "load" is a
+                // 600ms UI animation with no bytes on the wire, so calling
+                // it "Downloading" would be a lie. Device MLX and sim
+                // CoreML (opt-in) both hit HuggingFace for real weights.
+                //
+                // `modelName` is the simplest signal we have for "which
+                // path is this?" — it's pre-seeded in LLMService before
+                // load() runs, so it's correct from t=0. Keep this mapping
+                // in sync with `LLMService.modelName` defaults.
+                Text(loadProgressLabel)
                     .font(.caption).monospaced()
             } else {
                 Button("Load model") {
@@ -141,6 +150,16 @@ struct ContentView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .background(Capsule().fill(Color.white.opacity(0.08)))
+    }
+
+    /// Chip label during load. Honest per-path wording so the user can't
+    /// mistake the 600ms sim-stub animation for a real download.
+    private var loadProgressLabel: String {
+        let pct = Int(llm.loadProgress * 100)
+        if llm.modelName == "stub-sim-llm" {
+            return "Warming stub \(pct)%"
+        }
+        return "Downloading \(pct)%"
     }
 
     private var turnOutput: some View {

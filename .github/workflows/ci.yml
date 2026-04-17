@@ -50,6 +50,15 @@ jobs:
       - name: Test
         run: swift test --parallel
 
+      - name: VoiceProbe stub reply stability (Slice 10)
+        # Compiles ios/DemoApp/Sources/Services/SimulatorStubReply.swift
+        # against an in-line driver and asserts the canonical output for
+        # "hello" (plus 3 edge cases). Cheap — pure swiftc + a tiny
+        # binary — but pins the -EDGEPROBE_AUTOGENERATE output contract
+        # without needing to boot a simulator or link MLX.
+        working-directory: ${{ github.workspace }}
+        run: bash scripts/voiceprobe-stub-smoke.sh
+
   backend:
     name: Backend — bun test + typecheck
     runs-on: ubuntu-latest
