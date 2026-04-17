@@ -212,6 +212,44 @@ export class PgSpanStore implements SpanStore {
     }
     return summaries
   }
+
+  async tryRecordContentHash(
+    orgId: string,
+    contentHash: string,
+    minuteBucket: string,
+  ): Promise<boolean> {
+    // Auto-upsert the org row so this works even before a first trace lands
+    // for a never-before-seen org. Same pattern as insertTrace — see class doc.
+    await this.sql`
+      INSERT INTO orgs (id, name) VALUES (${orgId}, ${orgId})
+      ON CONFLICT (id) DO NOTHING
+    `
+    // Use INSERT ... ON CONFLICT DO NOTHING and inspect the `RETURNING` row
+    // presence. If a row came back, this was a novel insert. Otherwise the
+    // UNIQUE(org_id, content_hash, minute_bucket) constraint ate it.
+    const rows = await this.sql<Array<{ content_hash: string }>>`
+      INSERT INTO ingest_dedup (org_id, content_hash, minute_bucket)
+      VALUES (${orgId}, ${contentHash}, ${minuteBucket})
+      ON CONFLICT (org_id, content_hash, minute_bucket) DO NOTHING
+      RETURNING content_hash
+    `
+    return rows.length > 0
+  }
+
+  async purgeExpired(olderThan: Date): Promise<number> {
+    // Cascades to spans via FK ON DELETE CASCADE. We count before the app
+    // tier logs it, and also prune stale dedup rows so the dedup table
+    // doesn't grow forever.
+    const deletedTraces = await this.sql<Array<{ id: string }>>`
+      DELETE FROM traces WHERE started_at < ${olderThan.toISOString()}::timestamptz
+      RETURNING id
+    `
+    await this.sql`
+      DELETE FROM ingest_dedup
+      WHERE created_at < ${olderThan.toISOString()}::timestamptz
+    `
+    return deletedTraces.length
+  }
 }
 
 function clampLimit(v: number | undefined): number {

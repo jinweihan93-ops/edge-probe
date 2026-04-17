@@ -12,6 +12,15 @@ import {
 } from "./shareToken.ts"
 import { getAuthenticatedOrg, parseDashboardKeys, testDashboardKeys } from "./auth.ts"
 import { renderOgPng, renderFallbackPng } from "./og.ts"
+import { RateLimiter } from "./rateLimit.ts"
+import { Metrics } from "./metrics.ts"
+import { contentHash, minuteBucket } from "./ingestHash.ts"
+
+/** Default ingest guardrails. All env-overridable at boot. */
+export const DEFAULT_INGEST_MAX_BYTES = 1 * 1024 * 1024 // 1 MB / request
+export const DEFAULT_SPANS_PER_SEC = 100 // per org — 6000 spans/min sustained
+export const DEFAULT_BYTES_PER_DAY = 100 * 1024 * 1024 // 100 MB / org / day
+export const DEFAULT_RETENTION_DAYS = 30
 
 export interface AppDeps {
   store: SpanStore
@@ -23,6 +32,21 @@ export interface AppDeps {
    * self-assert an org via a header anymore. See `src/auth.ts`.
    */
   dashboardKeys: Map<string, string>
+  /** Per-org token-bucket limiter. See `rateLimit.ts`. */
+  rateLimiter: RateLimiter
+  /** In-process counter registry exposed via `GET /metrics`. */
+  metrics: Metrics
+  /**
+   * Max accepted request body size in bytes at /ingest. Enforced before
+   * JSON parse — we don't read an arbitrary amount of memory on behalf of
+   * an untrusted client.
+   */
+  maxIngestBytes: number
+  /**
+   * Clock used by dedup bucketing. Injectable so tests can freeze "now".
+   * Rate limiter has its own clock (both default to Date.now).
+   */
+  now: () => Date
 }
 
 /**
@@ -34,40 +58,135 @@ export interface AppDeps {
  * two deployments.
  */
 export function createApp(deps: AppDeps) {
-  const { store, views, signer, dashboardKeys } = deps
+  const { store, views, signer, dashboardKeys, rateLimiter, metrics, maxIngestBytes, now } = deps
   const app = new Hono()
 
   app.get("/healthz", (c) => c.json({ ok: true }))
 
   /**
-   * POST /ingest — accepts OTLP-shaped JSON (simplified Day 1 shape).
-   * Auth: `Authorization: Bearer epk_pub_...` (verification is a TODO; for now
-   * we require any Bearer header to land, to exercise the contract).
+   * GET /metrics — Prometheus-style exposition. Zero auth on purpose:
+   * everything here is counters about the server's own behavior, never
+   * customer data. Scrapers come from inside the network boundary.
    *
-   * Real OTLP/HTTP protobuf lands in month 13. This shape is the minimum to
-   * wire the SDK to an endpoint end-to-end.
+   * If we ever expose this publicly on the internet we'll gate it —
+   * for now it lives alongside /healthz as an ops-only surface.
+   */
+  app.get("/metrics", (c) => {
+    return c.text(metrics.render(), 200, {
+      "Content-Type": "text/plain; version=0.0.4; charset=utf-8",
+      "Cache-Control": "no-store",
+    })
+  })
+
+  /**
+   * POST /ingest — accepts OTLP-shaped JSON (simplified Day 1 shape).
+   * Auth: `Authorization: Bearer epk_pub_...` (Slice 5 upgrades this from
+   * "any pub-prefixed string lands" to "hashed key lookup with per-key org").
+   *
+   * Hardening (Slice 4):
+   *   1. Payload size cap (Content-Length + actual bytes).
+   *   2. Per-org token bucket (spans/sec + bytes/day).
+   *   3. SHA-256 content dedup with 1-minute buckets — identical retries
+   *      return 202 `deduped: true` and are NOT stored.
+   *
+   * Each reject increments `edgeprobe_spans_dropped_total{reason=...}`.
+   * Successful inserts increment `edgeprobe_spans_ingested_total`.
    */
   app.post("/ingest", async (c) => {
     const auth = c.req.header("Authorization")
     if (!auth || !auth.startsWith("Bearer epk_pub_")) {
+      metrics.inc("edgeprobe_ingest_requests_total", { outcome: "unauthorized" })
       return c.json({ error: "missing or malformed public ingest key" }, 401)
     }
 
-    const body = (await c.req.json()) as {
-      trace: Trace
-      spans: StoredSpan[]
+    // Size cap — reject declared-oversize requests before reading the body.
+    // Defense in depth: we also re-check after reading, because a malicious
+    // client can lie about Content-Length.
+    const contentLengthHdr = c.req.header("Content-Length")
+    const declaredLen = contentLengthHdr ? Number(contentLengthHdr) : NaN
+    if (Number.isFinite(declaredLen) && declaredLen > maxIngestBytes) {
+      metrics.inc("edgeprobe_spans_dropped_total", { reason: "size" })
+      metrics.inc("edgeprobe_ingest_requests_total", { outcome: "too_large" })
+      return c.json({ error: "payload too large" }, 413)
+    }
+
+    const rawBuffer = await c.req.arrayBuffer()
+    const bytes = new Uint8Array(rawBuffer)
+    if (bytes.byteLength > maxIngestBytes) {
+      metrics.inc("edgeprobe_spans_dropped_total", { reason: "size" })
+      metrics.inc("edgeprobe_ingest_requests_total", { outcome: "too_large" })
+      return c.json({ error: "payload too large" }, 413)
+    }
+
+    let body: { trace: Trace; spans: StoredSpan[] }
+    try {
+      body = JSON.parse(new TextDecoder().decode(bytes))
+    } catch {
+      metrics.inc("edgeprobe_ingest_requests_total", { outcome: "bad_json" })
+      return c.json({ error: "invalid json" }, 400)
     }
 
     if (!body?.trace?.id || !Array.isArray(body?.spans)) {
+      metrics.inc("edgeprobe_ingest_requests_total", { outcome: "bad_shape" })
       return c.json({ error: "invalid ingest payload: need { trace, spans[] }" }, 400)
+    }
+
+    // Rate limit on the payload's asserted orgId. Slice 5 will make the
+    // key-to-org mapping load-bearing so we can trust this without a
+    // redundant cross-check here — for now, the "mark but allow" posture
+    // of the old ingest stayed (any epk_pub_... lands), and the bucket is
+    // the first guard against replay floods and bursty clients.
+    const orgId = typeof body.trace.orgId === "string" ? body.trace.orgId : "unknown"
+    const spanCount = body.spans.length
+    const decision = rateLimiter.check(orgId, spanCount, bytes.byteLength)
+    if (!decision.allowed) {
+      metrics.inc(
+        "edgeprobe_spans_dropped_total",
+        { reason: "rate_limit" },
+        Math.max(1, spanCount),
+      )
+      metrics.inc("edgeprobe_ingest_requests_total", { outcome: "rate_limited" })
+      return c.json(
+        {
+          error: "rate limited",
+          reason: decision.reason,
+          retryAfterSeconds: decision.retryAfterSeconds,
+        },
+        429,
+        { "Retry-After": String(decision.retryAfterSeconds ?? 1) },
+      )
+    }
+
+    // Dedup — (orgId, sha256(body), minute) must be novel.
+    const hash = contentHash(bytes)
+    const bucket = minuteBucket(now())
+    const novel = await store.tryRecordContentHash(orgId, hash, bucket)
+    if (!novel) {
+      metrics.inc(
+        "edgeprobe_spans_dropped_total",
+        { reason: "dedup" },
+        Math.max(1, spanCount),
+      )
+      metrics.inc("edgeprobe_ingest_requests_total", { outcome: "deduped" })
+      // 202 on purpose — a dedup'd retry is the client's retry working as
+      // designed. From the client's perspective the upload "happened". We
+      // just don't store the second copy.
+      return c.json(
+        {
+          accepted: { traceId: body.trace.id, spanCount, deduped: true },
+        },
+        202,
+      )
     }
 
     await store.insertTrace(body.trace)
     for (const span of body.spans) {
       await store.insertSpan(span)
     }
+    metrics.inc("edgeprobe_spans_ingested_total", {}, spanCount)
+    metrics.inc("edgeprobe_ingest_requests_total", { outcome: "accepted" })
 
-    return c.json({ accepted: { traceId: body.trace.id, spanCount: body.spans.length } }, 202)
+    return c.json({ accepted: { traceId: body.trace.id, spanCount } }, 202)
   })
 
   /**
@@ -305,15 +424,40 @@ export function createApp(deps: AppDeps) {
  *
  * `dashboardKeys` defaults to the test mapping (acme + competitor). Tests
  * that want to exercise "no valid key" can pass an empty Map.
+ *
+ * The rate limiter is generously sized so existing fixtures don't trip it
+ * accidentally — tests that specifically exercise rate limiting construct
+ * their own tight limiter.
  */
 export function makeMemoryDeps(
   shareTokenSecret: string,
   dashboardKeys: Map<string, string> = testDashboardKeys(),
+  overrides: Partial<Pick<AppDeps, "rateLimiter" | "metrics" | "maxIngestBytes" | "now">> = {},
 ): AppDeps {
   const store = new InMemorySpanStore()
   const views = new SpanViews(store)
   const signer = new HmacShareTokenSigner(shareTokenSecret)
-  return { store, views, signer, dashboardKeys }
+  const rateLimiter =
+    overrides.rateLimiter ??
+    new RateLimiter({
+      // Loose by default for existing tests; tight limiter is injected by
+      // the few tests that actually exercise /ingest rate limiting.
+      spansPerSec: 10_000,
+      bytesPerDay: 10 * 1024 * 1024 * 1024, // 10 GB
+    })
+  const metrics = overrides.metrics ?? new Metrics()
+  const maxIngestBytes = overrides.maxIngestBytes ?? DEFAULT_INGEST_MAX_BYTES
+  const now = overrides.now ?? (() => new Date())
+  return {
+    store,
+    views,
+    signer,
+    dashboardKeys,
+    rateLimiter,
+    metrics,
+    maxIngestBytes,
+    now,
+  }
 }
 
 /**
@@ -328,8 +472,19 @@ export async function makeDefaultDeps(config: {
   shareTokenSecret: string
   dashboardKeys: Map<string, string>
   databaseUrl?: string | undefined
+  maxIngestBytes?: number
+  spansPerSec?: number
+  bytesPerDay?: number
 }): Promise<AppDeps> {
   const signer = new HmacShareTokenSigner(config.shareTokenSecret)
+  const metrics = new Metrics()
+  const rateLimiter = new RateLimiter({
+    spansPerSec: config.spansPerSec ?? DEFAULT_SPANS_PER_SEC,
+    bytesPerDay: config.bytesPerDay ?? DEFAULT_BYTES_PER_DAY,
+  })
+  const maxIngestBytes = config.maxIngestBytes ?? DEFAULT_INGEST_MAX_BYTES
+  const now = () => new Date()
+
   if (config.databaseUrl) {
     const sql = createSQL(config.databaseUrl)
     const applied = await runMigrations(sql)
@@ -337,10 +492,24 @@ export async function makeDefaultDeps(config: {
       console.log(`[migrate] applied: ${applied.join(", ")}`)
     }
     const store = new PgSpanStore(sql)
-    return { store, views: new SpanViews(store), signer, dashboardKeys: config.dashboardKeys }
+    return {
+      store,
+      views: new SpanViews(store),
+      signer,
+      dashboardKeys: config.dashboardKeys,
+      rateLimiter,
+      metrics,
+      maxIngestBytes,
+      now,
+    }
   }
   console.warn("[server] DATABASE_URL not set — using in-memory store (data lost on restart)")
-  return makeMemoryDeps(config.shareTokenSecret, config.dashboardKeys)
+  return makeMemoryDeps(config.shareTokenSecret, config.dashboardKeys, {
+    rateLimiter,
+    metrics,
+    maxIngestBytes,
+    now,
+  })
 }
 
 function requireShareSecret(): string {
@@ -365,15 +534,74 @@ function requireDashboardKeys(): Map<string, string> {
   return keys
 }
 
+/**
+ * Run the retention sweep once. Drops traces (and cascades to spans) older
+ * than `retentionDays`. Returns the count purged for log/metric purposes.
+ *
+ * Exposed so tests can call it directly with a pinned `now`, and the
+ * scheduled timer below can call it on an interval without re-implementing
+ * the math.
+ */
+export async function runRetentionSweep(
+  deps: AppDeps,
+  retentionDays: number,
+  now: Date = new Date(),
+): Promise<number> {
+  const cutoff = new Date(now.getTime() - retentionDays * 24 * 60 * 60 * 1000)
+  const removed = await deps.store.purgeExpired(cutoff)
+  if (removed > 0) {
+    deps.metrics.inc("edgeprobe_traces_purged_total", {}, removed)
+    console.log(`[retention] purged ${removed} traces older than ${cutoff.toISOString()}`)
+  }
+  return removed
+}
+
+function envInt(name: string, fallback: number): number {
+  const raw = process.env[name]
+  if (!raw) return fallback
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new Error(`${name} must be a positive integer, got ${JSON.stringify(raw)}`)
+  }
+  return Math.floor(n)
+}
+
 // Allow `bun run src/server.ts` to boot the server directly.
 if (import.meta.main) {
+  const maxIngestBytes = envInt("INGEST_MAX_BYTES", DEFAULT_INGEST_MAX_BYTES)
+  const spansPerSec = envInt("INGEST_SPANS_PER_SEC", DEFAULT_SPANS_PER_SEC)
+  const bytesPerDay = envInt("INGEST_BYTES_PER_DAY", DEFAULT_BYTES_PER_DAY)
+  const retentionDays = envInt("RETENTION_DAYS", DEFAULT_RETENTION_DAYS)
+
   const deps = await makeDefaultDeps({
     shareTokenSecret: requireShareSecret(),
     dashboardKeys: requireDashboardKeys(),
     databaseUrl: process.env.DATABASE_URL,
+    maxIngestBytes,
+    spansPerSec,
+    bytesPerDay,
   })
   const app = createApp(deps)
   const port = Number(process.env.PORT ?? 3000)
-  console.log(`EdgeProbe backend listening on :${port}`)
+  console.log(
+    `EdgeProbe backend listening on :${port} ` +
+      `(max ${maxIngestBytes}B/req, ${spansPerSec} spans/s, ${bytesPerDay}B/day, retain ${retentionDays}d)`,
+  )
+
+  // Run the retention sweep once at boot (so a stopped backend that missed
+  // ticks still catches up), then hourly. 1h is the smallest useful cadence —
+  // more frequent and we'd be reading the index for no new deletes.
+  await runRetentionSweep(deps, retentionDays).catch((err) => {
+    console.error("[retention] boot sweep failed", err)
+  })
+  setInterval(
+    () => {
+      runRetentionSweep(deps, retentionDays).catch((err) => {
+        console.error("[retention] sweep failed", err)
+      })
+    },
+    60 * 60 * 1000,
+  )
+
   Bun.serve({ port, fetch: app.fetch })
 }

@@ -167,11 +167,30 @@ export interface SpanStore {
    * pages. No `offset` because that's a footgun at scale.
    */
   listTraces(orgId: string, projectId: string, opts?: ListTracesOpts): Promise<TraceSummary[]>
+  /**
+   * Atomically record `(orgId, contentHash, minuteBucket)` as "seen". Returns
+   * `true` if the row was novel (i.e. the caller should proceed with insert),
+   * `false` if it was a duplicate inside the same minute.
+   *
+   * The tuple is UNIQUE in Postgres; the in-memory version uses a Set with
+   * the same semantics. Either way, two racing callers with identical bytes
+   * in the same minute: exactly one gets `true`.
+   */
+  tryRecordContentHash(orgId: string, contentHash: string, minuteBucket: string): Promise<boolean>
+  /**
+   * Delete traces whose `startedAt` is strictly earlier than `olderThan`.
+   * Returns the number of traces deleted. Spans cascade (Pg) or are dropped
+   * together (in-memory). Callers use this via a scheduled worker — tests
+   * invoke it directly with a pinned `now`.
+   */
+  purgeExpired(olderThan: Date): Promise<number>
 }
 
 export class InMemorySpanStore implements SpanStore {
   private traces = new Map<string, Trace>()
   private spansByTrace = new Map<string, StoredSpan[]>()
+  /** Dedup keys — `${orgId}:${contentHash}:${minuteBucket}`. */
+  private dedup = new Set<string>()
 
   async insertTrace(t: Trace): Promise<void> {
     this.traces.set(t.id, t)
@@ -268,9 +287,34 @@ export class InMemorySpanStore implements SpanStore {
     }
   }
 
+  async tryRecordContentHash(
+    orgId: string,
+    contentHash: string,
+    minuteBucket: string,
+  ): Promise<boolean> {
+    const key = `${orgId}:${contentHash}:${minuteBucket}`
+    if (this.dedup.has(key)) return false
+    this.dedup.add(key)
+    return true
+  }
+
+  async purgeExpired(olderThan: Date): Promise<number> {
+    const cutoff = olderThan.toISOString()
+    let removed = 0
+    for (const [id, t] of this.traces) {
+      if (t.startedAt < cutoff) {
+        this.traces.delete(id)
+        this.spansByTrace.delete(id)
+        removed += 1
+      }
+    }
+    return removed
+  }
+
   reset(): void {
     this.traces.clear()
     this.spansByTrace.clear()
+    this.dedup.clear()
   }
 }
 

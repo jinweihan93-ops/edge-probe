@@ -12,7 +12,7 @@ Follow-up work creates a new slice, not a rename.
 - [x] **Slice 1** — GitHub Action + PR comment template
 - [x] **Slice 2** — OG image generator (`/og/{token}.png`)
 - [x] **Slice 3** — `/app` home dashboard (project + session lists)
-- [ ] **Slice 4** — Per-org rate limits + content-hash dedup + payload caps + 30-day expiry
+- [x] **Slice 4** — Per-org rate limits + content-hash dedup + payload caps + 30-day expiry
 - [ ] **Slice 5** — Two-key auth finish (`epk_pub_` ingest vs `epk_priv_` dashboard, rotation)
 - [ ] **Slice 6** — Per-call `includeContent` + `sensitive=true` projection guard (SDK + backend)
 - [ ] **Slice 7** — Six critical regression tests as an explicit named suite

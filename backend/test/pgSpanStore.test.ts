@@ -274,4 +274,99 @@ describePg("PgSpanStore roundtrip (TEST_DATABASE_URL)", () => {
     const applied = await runMigrations(sql)
     expect(applied).toEqual([])
   })
+
+  test("tryRecordContentHash: novel → true; duplicate within same minute → false", async () => {
+    const first = await store.tryRecordContentHash(
+      "org_acme",
+      "a".repeat(64),
+      "2026-04-17T12:00:00.000Z",
+    )
+    expect(first).toBe(true)
+    const again = await store.tryRecordContentHash(
+      "org_acme",
+      "a".repeat(64),
+      "2026-04-17T12:00:00.000Z",
+    )
+    expect(again).toBe(false)
+  })
+
+  test("tryRecordContentHash: same content, different minute → true twice", async () => {
+    const minute1 = await store.tryRecordContentHash(
+      "org_acme",
+      "b".repeat(64),
+      "2026-04-17T12:00:00.000Z",
+    )
+    const minute2 = await store.tryRecordContentHash(
+      "org_acme",
+      "b".repeat(64),
+      "2026-04-17T12:01:00.000Z",
+    )
+    expect(minute1).toBe(true)
+    expect(minute2).toBe(true)
+  })
+
+  test("tryRecordContentHash: same content, different orgs → novel for each", async () => {
+    const a = await store.tryRecordContentHash(
+      "org_acme",
+      "c".repeat(64),
+      "2026-04-17T12:00:00.000Z",
+    )
+    const b = await store.tryRecordContentHash(
+      "org_competitor",
+      "c".repeat(64),
+      "2026-04-17T12:00:00.000Z",
+    )
+    expect(a).toBe(true)
+    expect(b).toBe(true)
+  })
+
+  test("purgeExpired removes stale traces, keeps fresh ones, cascades to spans", async () => {
+    // Two traces, one stale, one fresh. Also a stale dedup row.
+    await store.insertTrace({
+      id: "t_stale",
+      orgId: "org_acme",
+      projectId: "p",
+      sessionId: null,
+      startedAt: "2026-01-01T00:00:00Z",
+      endedAt: null,
+      device: {},
+      attributes: {},
+      sensitive: false,
+    })
+    await store.insertSpan({
+      id: "s_stale",
+      traceId: "t_stale",
+      parentSpanId: null,
+      name: "x",
+      kind: "llm",
+      startedAt: "2026-01-01T00:00:00Z",
+      endedAt: "2026-01-01T00:00:01Z",
+      durationMs: 1000,
+      status: "ok",
+      attributes: {},
+      includeContent: false,
+      promptText: null,
+      completionText: null,
+      transcriptText: null,
+    })
+    await store.insertTrace({
+      id: "t_fresh",
+      orgId: "org_acme",
+      projectId: "p",
+      sessionId: null,
+      startedAt: "2026-04-17T00:00:00Z",
+      endedAt: null,
+      device: {},
+      attributes: {},
+      sensitive: false,
+    })
+
+    const removed = await store.purgeExpired(new Date("2026-03-18T00:00:00Z"))
+    expect(removed).toBe(1)
+    expect(await store.getTrace("t_stale")).toBeUndefined()
+    expect(await store.getTrace("t_fresh")).toBeDefined()
+    // Cascade: span for t_stale must be gone.
+    const spans = await store.getSpansForTrace("t_stale")
+    expect(spans).toEqual([])
+  })
 })

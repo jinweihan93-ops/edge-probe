@@ -278,6 +278,68 @@ if [ "$NOT_FOUND_STATUS" != "404" ]; then
 fi
 echo "[e2e]   → missing trace returns 404 ✓"
 
+# ---- 7a. Ingest hardening — same payload again in the same minute must be deduped ----
+# Slice 4: a replay storm returns 202 deduped=true and does NOT double-insert.
+echo "[e2e] POST /ingest (replay — must be deduped)"
+DEDUP_STATUS=$(curl -sS -o /tmp/edgeprobe-dedup.json -w "%{http_code}" \
+  -X POST "$BASE/ingest" \
+  -H "Authorization: Bearer epk_pub_e2e_key" \
+  -H "Content-Type: application/json" \
+  --data-binary "$PAYLOAD")
+if [ "$DEDUP_STATUS" != "202" ]; then
+  echo "[e2e] FAIL: dedup replay returned $DEDUP_STATUS, expected 202" >&2
+  cat /tmp/edgeprobe-dedup.json >&2
+  exit 1
+fi
+if ! grep -q '"deduped":true' /tmp/edgeprobe-dedup.json; then
+  echo "[e2e] FAIL: dedup replay did not flag deduped:true — replay would have double-stored" >&2
+  cat /tmp/edgeprobe-dedup.json >&2
+  exit 1
+fi
+echo "[e2e]   → replay ingest deduped ✓"
+
+# ---- 7b. Oversize ingest returns 413 ----
+# We build a trivially-oversize payload by padding the attributes bag. With
+# Content-Length headered truthfully, the backend must reject before parse.
+echo "[e2e] POST /ingest (oversize — must be 413)"
+BIG_PAYLOAD='{"trace":{"id":"t_big","orgId":"org_acme","projectId":"p","sessionId":null,"startedAt":"2026-04-17T12:00:00Z","endedAt":null,"device":{},'
+BIG_PAYLOAD="${BIG_PAYLOAD}\"attributes\":{\"pad\":\"$(printf 'x%.0s' $(seq 1 2000000))\"},\"sensitive\":false},\"spans\":[]}"
+BIG_STATUS=$(printf '%s' "$BIG_PAYLOAD" | curl -sS -o /dev/null -w "%{http_code}" \
+  -X POST "$BASE/ingest" \
+  -H "Authorization: Bearer epk_pub_e2e_key" \
+  -H "Content-Type: application/json" \
+  --data-binary @-)
+if [ "$BIG_STATUS" != "413" ]; then
+  echo "[e2e] FAIL: oversize /ingest returned $BIG_STATUS, expected 413 (size cap broken?)" >&2
+  exit 1
+fi
+echo "[e2e]   → oversize /ingest → 413 ✓"
+
+# ---- 7c. GET /metrics — Prometheus exposition, counters present ----
+echo "[e2e] GET /metrics"
+curl -fsS "$BASE/metrics" > /tmp/edgeprobe-metrics.txt
+if ! grep -q "edgeprobe_spans_dropped_total" /tmp/edgeprobe-metrics.txt; then
+  echo "[e2e] FAIL: /metrics missing edgeprobe_spans_dropped_total counter" >&2
+  cat /tmp/edgeprobe-metrics.txt >&2
+  exit 1
+fi
+if ! grep -q "edgeprobe_spans_ingested_total" /tmp/edgeprobe-metrics.txt; then
+  echo "[e2e] FAIL: /metrics missing edgeprobe_spans_ingested_total counter" >&2
+  exit 1
+fi
+# Dedup branch must have registered at least 1 drop after 7a.
+if ! grep -E 'edgeprobe_spans_dropped_total\{reason="dedup"\} [1-9]' /tmp/edgeprobe-metrics.txt >/dev/null; then
+  echo "[e2e] FAIL: /metrics shows no dedup drops after replay storm" >&2
+  cat /tmp/edgeprobe-metrics.txt >&2
+  exit 1
+fi
+# Size branch must have registered at least 1 drop after 7b.
+if ! grep -E 'edgeprobe_spans_dropped_total\{reason="size"\} [1-9]' /tmp/edgeprobe-metrics.txt >/dev/null; then
+  echo "[e2e] FAIL: /metrics shows no size drops after oversize post" >&2
+  exit 1
+fi
+echo "[e2e]   → /metrics has dedup + size counters incremented ✓"
+
 # ======================================================================
 # Web dashboard: same checks, against the rendered HTML surface.
 # Starts a second process pointing at the backend we just exercised.
