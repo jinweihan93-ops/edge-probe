@@ -82,4 +82,32 @@ export class BackendClient {
     if (!res.ok) return { status: res.status, body: null }
     return { status: res.status, body: (await res.json()) as PrivateTraceResponse }
   }
+
+  /**
+   * Fetches an OG card PNG. We proxy through the web layer so that the
+   * `<meta property="og:image">` URL shares an origin with the share page —
+   * some unfurl bots follow redirects and some don't, and keeping the card
+   * on the same host sidesteps the difference. The web layer does not
+   * inspect the bytes; it forwards status + `Cache-Control` intact.
+   *
+   * Returns `null` when the backend is unreachable (network failure). The
+   * backend already guarantees a branded fallback PNG with status 404 for
+   * every "don't tell me why" failure, so a non-null response is always
+   * something safe to pipe through.
+   */
+  async fetchOgPng(
+    filename: string,
+  ): Promise<{ status: number; body: Uint8Array; cacheControl: string } | null> {
+    try {
+      const res = await this.fetchImpl(`${this.baseUrl}/og/${encodeURIComponent(filename)}`)
+      const body = new Uint8Array(await res.arrayBuffer())
+      return {
+        status: res.status,
+        body,
+        cacheControl: res.headers.get("Cache-Control") ?? "public, max-age=300",
+      }
+    } catch {
+      return null
+    }
+  }
 }

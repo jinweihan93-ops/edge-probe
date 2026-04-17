@@ -51,13 +51,59 @@ export function createWebApp(deps: WebDeps) {
    *   - A stranger cannot distinguish expired / tampered / missing / sensitive.
    *   - No content text can be rendered because the backend's /r/:token
    *     response has no content fields.
+   *
+   * We mint an absolute `ogImageUrl` from the request URL (NOT from an env
+   * var), so the OG card is always same-origin with the share page. Some
+   * unfurl bots follow cross-origin redirects, some don't — matching origins
+   * is the boring safe move.
    */
   app.get("/r/:token", async (c) => {
-    const data = await backend.fetchPublic(c.req.param("token"))
+    const token = c.req.param("token")
+    const data = await backend.fetchPublic(token)
     if (!data) {
       return c.html(<NotFoundPage />, 404)
     }
-    return c.html(<PublicTracePage data={data} />)
+    const url = new URL(c.req.url)
+    const ogImageUrl = `${url.protocol}//${url.host}/og/${encodeURIComponent(token)}.png`
+    return c.html(<PublicTracePage data={data} ogImageUrl={ogImageUrl} />)
+  })
+
+  /**
+   * GET /og/:filename — OG card proxy.
+   *
+   * Pure pass-through to the backend: the web layer has no trace data of
+   * its own, no rendering, no caching decision. We forward the status code
+   * and `Cache-Control` header intact so the backend remains the single
+   * source of truth for both the PNG bytes and the freshness policy.
+   *
+   * The route exists purely so `<meta property="og:image">` can point at
+   * the same origin as `/r/:token`. See the comment in the `/r/:token`
+   * handler for why that matters.
+   *
+   * Failure modes:
+   *   - Backend returns 404 + branded fallback PNG → we pipe it through.
+   *     A scraper sees a valid PNG either way; 200 vs 404 is the only
+   *     observable difference.
+   *   - Backend unreachable (network error) → we render our own 404
+   *     JSON stub. This is the ONLY path that emits non-PNG bytes; it's
+   *     reserved for the degenerate "backend is down entirely" case and
+   *     is not reachable in the security model.
+   */
+  app.get("/og/:filename", async (c) => {
+    const filename = c.req.param("filename")
+    const resp = await backend.fetchOgPng(filename)
+    if (!resp) {
+      return c.json({ error: "backend unavailable" }, 502)
+    }
+    // `new Uint8Array(resp.body)` re-wraps the backed ArrayBufferLike as a
+    // concrete ArrayBuffer for Hono's body typing; zero-copy in practice
+    // because we're sharing the underlying buffer.
+    const payload = new Uint8Array(resp.body)
+    return c.body(payload, resp.status as 200 | 404, {
+      "Content-Type": "image/png",
+      "Content-Length": String(payload.length),
+      "Cache-Control": resp.cacheControl,
+    })
   })
 
   /**

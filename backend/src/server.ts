@@ -11,6 +11,7 @@ import {
   type ShareTokenSigner,
 } from "./shareToken.ts"
 import { getAuthenticatedOrg, parseDashboardKeys, testDashboardKeys } from "./auth.ts"
+import { renderOgPng, renderFallbackPng } from "./og.ts"
 
 export interface AppDeps {
   store: SpanStore
@@ -159,6 +160,61 @@ export function createApp(deps: AppDeps) {
       spans,
     })
   })
+
+  /**
+   * GET /og/:token.png — OG unfurl image for a public share token.
+   *
+   * Same auth posture as /r/:token — the token itself is the proof, there
+   * is no Authorization header. Every failure collapses to a branded
+   * fallback PNG with status 404; a scraper cannot distinguish a bad
+   * token from a missing trace from a sensitive trace.
+   *
+   * Cache headers: `public, max-age=3600, immutable`. Tokens encode an
+   * expiresAt, so the underlying resource is effectively frozen — 1 h
+   * staleness is safe and keeps Slack/Twitter unfurls snappy.
+   */
+  // Route as `/og/:filename` and extract the token ourselves because Hono's
+  // param syntax `/og/:token.png` treats `.png` as part of the param name —
+  // and share tokens contain literal `.` (they're `<body>.<sig>`), so the
+  // naive pattern double-misfires. Be explicit, then validate.
+  app.get("/og/:filename", async (c) => {
+    const filename = c.req.param("filename")
+    const fallback = () => {
+      const png = renderFallbackPng()
+      return c.body(new Uint8Array(png), 404, {
+        "Content-Type": "image/png",
+        "Content-Length": String(png.length),
+        "Cache-Control": "public, max-age=300",
+      })
+    }
+    if (!filename.endsWith(".png")) {
+      // Same fallback — don't leak "wrong extension" as a distinct 4xx.
+      return fallback()
+    }
+    const token = filename.slice(0, -".png".length)
+    if (!token) return fallback()
+
+    let payload
+    try {
+      payload = signer.verify(token)
+    } catch (err) {
+      if (err instanceof InvalidShareTokenError) return fallback()
+      throw err
+    }
+
+    const trace = await store.getTrace(payload.traceId)
+    if (!trace || trace.sensitive || trace.orgId !== payload.orgId) {
+      return fallback()
+    }
+
+    const spans = await views.public_forTrace(trace.id)
+    const png = renderOgPng({ trace, spans })
+    return c.body(new Uint8Array(png), 200, {
+      "Content-Type": "image/png",
+      "Content-Length": String(png.length),
+      "Cache-Control": "public, max-age=3600, immutable",
+    })
+  }) // END GET /og/:filename
 
   /**
    * GET /app/trace/:id — authenticated dashboard view. Full content when opted in.

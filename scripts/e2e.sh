@@ -158,6 +158,36 @@ if grep -q "SECRET COMPLETION" /tmp/edgeprobe-public.json; then
 fi
 echo "[e2e]   → public JSON has no prompt/completion text ✓"
 
+# ---- 3b. GET /og/<token>.png — must return a PNG with 200 ----
+# Real OG unfurl path: Slack/Twitter scrape <meta property="og:image">.
+# We don't validate pixels here — just PNG magic bytes + mimetype + status.
+echo "[e2e] GET /og/<token>.png (backend)"
+OG_STATUS=$(curl -sS -o /tmp/edgeprobe-og.png -w "%{http_code}" "$BASE/og/$SHARE_TOKEN.png")
+if [ "$OG_STATUS" != "200" ]; then
+  echo "[e2e] FAIL: /og/<valid>.png returned $OG_STATUS, expected 200" >&2
+  exit 1
+fi
+OG_MAGIC=$(head -c 4 /tmp/edgeprobe-og.png | od -An -tx1 | tr -d ' ')
+if [ "$OG_MAGIC" != "89504e47" ]; then
+  echo "[e2e] FAIL: /og/<valid>.png is not a PNG (magic=$OG_MAGIC)" >&2
+  exit 1
+fi
+echo "[e2e]   → OG PNG magic valid ✓"
+
+# ---- 3c. GET /og/<bogus>.png — must return a branded PNG with 404 ----
+echo "[e2e] GET /og/<bogus>.png (backend)"
+OG_BAD_STATUS=$(curl -sS -o /tmp/edgeprobe-og-bad.png -w "%{http_code}" "$BASE/og/not-a-token.png")
+if [ "$OG_BAD_STATUS" != "404" ]; then
+  echo "[e2e] FAIL: /og/<bogus>.png returned $OG_BAD_STATUS, expected 404" >&2
+  exit 1
+fi
+OG_BAD_MAGIC=$(head -c 4 /tmp/edgeprobe-og-bad.png | od -An -tx1 | tr -d ' ')
+if [ "$OG_BAD_MAGIC" != "89504e47" ]; then
+  echo "[e2e] FAIL: /og/<bogus>.png fallback is not a PNG (magic=$OG_BAD_MAGIC)" >&2
+  exit 1
+fi
+echo "[e2e]   → OG fallback PNG on bogus token ✓"
+
 # ---- 4. GET /r/<raw-traceId> must return 404 — raw ids are not tokens ----
 echo "[e2e] GET /r/$TRACE_ID (raw trace id, not a token)"
 RAW_STATUS=$(curl -sS -o /dev/null -w "%{http_code}" "$BASE/r/$TRACE_ID")
@@ -264,6 +294,31 @@ if ! grep -q "waterfall" /tmp/edgeprobe-web-public.html; then
   exit 1
 fi
 echo "[e2e]   → public HTML renders, no prompt text ✓"
+
+# ---- 9b. GET web /og/<token>.png — proxy to backend, PNG magic + 200 ----
+echo "[e2e] GET $WEB_BASE/og/<token>.png"
+WEB_OG_STATUS=$(curl -sS -o /tmp/edgeprobe-web-og.png -w "%{http_code}" "$WEB_BASE/og/$SHARE_TOKEN.png")
+if [ "$WEB_OG_STATUS" != "200" ]; then
+  echo "[e2e] FAIL: web /og proxy returned $WEB_OG_STATUS, expected 200" >&2
+  exit 1
+fi
+WEB_OG_MAGIC=$(head -c 4 /tmp/edgeprobe-web-og.png | od -An -tx1 | tr -d ' ')
+if [ "$WEB_OG_MAGIC" != "89504e47" ]; then
+  echo "[e2e] FAIL: web /og proxy returned non-PNG bytes (magic=$WEB_OG_MAGIC)" >&2
+  exit 1
+fi
+echo "[e2e]   → web OG proxy returns PNG ✓"
+
+# ---- 9c. og:image in the public HTML is a same-origin URL to the token PNG ----
+# Slack/Twitter pick up <meta property="og:image">. Must point at the web
+# origin (not the backend) so cookies / redirects don't cross hosts.
+echo "[e2e] verify og:image in public HTML"
+if ! grep -q "property=\"og:image\" content=\"$WEB_BASE/og/" /tmp/edgeprobe-web-public.html; then
+  echo "[e2e] FAIL: public HTML og:image doesn't point at $WEB_BASE/og/..." >&2
+  grep -i "og:image" /tmp/edgeprobe-web-public.html >&2 || true
+  exit 1
+fi
+echo "[e2e]   → og:image is same-origin ✓"
 
 # ---- 10. GET web /r/<bogus> — single 404 page for every failure mode ----
 echo "[e2e] GET $WEB_BASE/r/<bogus-token>"

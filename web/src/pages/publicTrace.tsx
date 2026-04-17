@@ -20,7 +20,19 @@ import { computeMetrics, computeWaterfall, formatMs } from "../lib/metrics.ts"
  * fail at runtime because the content fields aren't in the payload — but
  * the type system catches it first. That's the Day 1 invariant.
  */
-export function PublicTracePage({ data }: { data: PublicTraceResponse }) {
+export function PublicTracePage({
+  data,
+  ogImageUrl,
+}: {
+  data: PublicTraceResponse
+  /**
+   * Absolute URL to the `/og/:token.png` render of this trace. Threaded
+   * in by the `/r/:token` handler so it's same-origin with the page.
+   * Optional: tests that stub the BackendClient don't always need to
+   * synthesize one, and a missing value falls back to the summary card.
+   */
+  ogImageUrl?: string
+}) {
   const metrics = computeMetrics(data.trace, data.spans)
   const { rows, ticks, totalMs } = computeWaterfall(data.trace, data.spans)
 
@@ -33,6 +45,7 @@ export function PublicTracePage({ data }: { data: PublicTraceResponse }) {
     <Layout
       title={`${verdict} — ${formatMs(metrics.totalMs)} · EdgeProbe`}
       ogDescription={`${formatMs(metrics.totalMs)} turn, ${metrics.spanCount} spans. Timings only, no prompt text.`}
+      ogImage={ogImageUrl}
       publicSurface
     >
       <header class="section">

@@ -214,6 +214,77 @@ describe("OG + social unfurl metadata", () => {
     expect(ogDescMatch![1]).not.toContain(SECRET)
     expect(ogDescMatch![1]).toMatch(/\d+ ms turn/)
   })
+
+  test("public page emits og:image pointing at same-origin /og/:token.png", async () => {
+    const { app } = makeApp()
+    const res = await app.request("http://dashboard.example/r/tok.abc")
+    const html = await res.text()
+    // Same-origin URL (host = dashboard.example), token URL-encoded.
+    expect(html).toContain('property="og:image"')
+    expect(html).toMatch(/property="og:image" content="http:\/\/dashboard\.example\/og\/tok\.abc\.png"/)
+    // With an og:image, the twitter card upgrades to summary_large_image.
+    expect(html).toContain('name="twitter:card" content="summary_large_image"')
+  })
+
+  test("og:image URL URL-encodes the token safely (no HTML injection)", async () => {
+    const { app } = makeApp()
+    const res = await app.request("http://x/r/" + encodeURIComponent("weird token"))
+    const html = await res.text()
+    // The ` ` in "weird token" must be %20 inside the og:image URL, not a literal space.
+    expect(html).not.toMatch(/og:image" content="[^"]*weird token[^"]*\.png"/)
+    expect(html).toMatch(/og:image" content="[^"]*weird(%20|\+)token[^"]*\.png"/)
+  })
+})
+
+describe("OG proxy — /og/:filename", () => {
+  function deps(fetchOgPng: BackendClient["fetchOgPng"]): WebDeps {
+    const fakeBackend = {
+      fetchPublic: async () => null,
+      fetchPrivate: async () => ({ status: 404, body: null }),
+      fetchOgPng,
+    } as unknown as BackendClient
+    return { backend: fakeBackend, orgBearers: new Map() }
+  }
+
+  test("proxies a 200 PNG with backend's Cache-Control", async () => {
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00])
+    const app = createWebApp(
+      deps(async () => ({
+        status: 200,
+        body: png,
+        cacheControl: "public, max-age=3600, immutable",
+      })),
+    )
+    const res = await app.request("/og/tok.abc.png")
+    expect(res.status).toBe(200)
+    expect(res.headers.get("Content-Type")).toBe("image/png")
+    expect(res.headers.get("Cache-Control")).toBe("public, max-age=3600, immutable")
+    expect(res.headers.get("Content-Length")).toBe(String(png.length))
+    const body = new Uint8Array(await res.arrayBuffer())
+    expect(body.length).toBe(png.length)
+    expect(body[0]).toBe(0x89)
+  })
+
+  test("proxies a 404 fallback PNG (never leaks failure reason)", async () => {
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+    const app = createWebApp(
+      deps(async () => ({
+        status: 404,
+        body: png,
+        cacheControl: "public, max-age=300",
+      })),
+    )
+    const res = await app.request("/og/not-a-token.png")
+    expect(res.status).toBe(404)
+    expect(res.headers.get("Content-Type")).toBe("image/png")
+    expect(res.headers.get("Cache-Control")).toBe("public, max-age=300")
+  })
+
+  test("returns 502 when backend is unreachable (null response)", async () => {
+    const app = createWebApp(deps(async () => null))
+    const res = await app.request("/og/anything.png")
+    expect(res.status).toBe(502)
+  })
 })
 
 describe("Healthz", () => {
