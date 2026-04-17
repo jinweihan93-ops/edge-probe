@@ -44,17 +44,42 @@ final class LLMService: ObservableObject {
     @Published private(set) var isLoaded: Bool = false
 
     /// Written into the trace's span attributes so `gen_ai.request.model`
-    /// shows up verbatim in the dashboard. Matches HuggingFace id.
+    /// shows up verbatim in the dashboard. On simulator we swap in a stub
+    /// model name so nobody reads a trace and thinks they were looking at
+    /// real Llama output when they weren't.
+    #if targetEnvironment(simulator)
+    @Published private(set) var modelName: String = "stub-on-simulator"
+    #else
     @Published private(set) var modelName: String = "Llama-3.2-1B-Instruct-4bit"
+    #endif
 
     /// MLX-Swift's container holds the weights + tokenizer + processor and
     /// is `Sendable`-safe for `perform { context in ... }` calls.
     private var container: ModelContainer?
 
     /// Fetch + load the model. Idempotent: subsequent calls are no-ops.
+    ///
+    /// Simulator note: MLX's Metal allocator `abort()`s on iOS simulator
+    /// because Metal-for-compute isn't plumbed through. Instead of
+    /// crashing (SIGABRT in `mlx::core::metal::Device::Device`), we fake
+    /// a load so the rest of the voice-turn pipeline — ASR, span
+    /// instrumentation, TTS, share — still runs and exercises the
+    /// EdgeProbe dashboard end-to-end. Real-device builds use MLX for
+    /// real. See generate() below for the matching stub responder.
     func load() async throws {
         if isLoaded { return }
 
+        #if targetEnvironment(simulator)
+        // Fake a quick "download" so the UI progress bar shows something
+        // believable and the "Ready" state flips naturally.
+        for step in stride(from: 0.0, to: 1.0, by: 0.1) {
+            self.loadProgress = step
+            try? await Task.sleep(nanoseconds: 40_000_000) // 40 ms
+        }
+        self.loadProgress = 1.0
+        self.isLoaded = true
+        return
+        #else
         // Tight memory budget for a 1B model on iPhone; MLX examples default
         // is fine but making it explicit is good discipline on device.
         MLX.GPU.set(cacheLimit: 128 * 1024 * 1024)
@@ -69,21 +94,40 @@ final class LLMService: ObservableObject {
             defaultPrompt: "You are a concise voice assistant. Reply in one or two short sentences."
         )
 
+        // `@Sendable` so the progress callback isn't inferred @MainActor
+        // from this enclosing class — MLX calls it on its own loader
+        // thread, same MainActor-vs-background crash class as the audio
+        // tap in ASRService. The body already hops to MainActor before
+        // mutating @Published state.
         self.container = try await LLMModelFactory.shared.loadContainer(
             configuration: config
-        ) { [weak self] progress in
+        ) { @Sendable [weak self] progress in
             Task { @MainActor [weak self] in
                 self?.loadProgress = progress.fractionCompleted
             }
         }
         self.isLoaded = true
         self.loadProgress = 1.0
+        #endif
     }
 
     /// Generate a reply to `prompt`. Greedy-ish sampling, capped at 128 tokens,
     /// which keeps replies voice-friendly. Returns the full decoded string;
     /// streaming partials to UI could come later but isn't the demo's job.
+    ///
+    /// Simulator: returns a canned sentence with a small artificial delay
+    /// so the LLM span in the trace has a visible, non-zero duration that
+    /// the dashboard waterfall can draw. Honest stand-in — matches
+    /// `modelName = "stub-on-simulator"` above.
     func generate(_ prompt: String) async throws -> String {
+        #if targetEnvironment(simulator)
+        guard isLoaded else { throw LLMError.modelNotLoaded }
+        // ~600 ms: similar order of magnitude to what 1B Llama takes on an
+        // A17 Pro, so the LLM tile in the dashboard shows a realistic slice.
+        try? await Task.sleep(nanoseconds: 600_000_000)
+        let preview = prompt.prefix(80)
+        return "(simulator stub) You said: \"\(preview)\". On a real device this reply comes from on-device Llama."
+        #else
         guard let container else {
             throw LLMError.modelNotLoaded
         }
@@ -127,5 +171,6 @@ final class LLMService: ObservableObject {
         } catch {
             throw LLMError.inferenceFailed(error.localizedDescription)
         }
+        #endif
     }
 }

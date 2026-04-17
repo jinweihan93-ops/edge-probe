@@ -117,7 +117,12 @@ final class ASRService: NSObject, ObservableObject {
         let input = audioEngine.inputNode
         let recordingFormat = input.outputFormat(forBus: 0)
         input.removeTap(onBus: 0)
-        input.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak req] buffer, _ in
+        // `@Sendable` strips the inherited @MainActor isolation from this
+        // closure. AVAudioEngine fires the tap on a real-time audio
+        // thread; without @Sendable, Swift 6 runtime asserts
+        // "not on MainActor" on the very first audio buffer and SIGTRAPs.
+        // `req?.append(buffer)` is thread-safe per Apple's Speech docs.
+        input.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { @Sendable [weak req] buffer, _ in
             req?.append(buffer)
         }
 
@@ -131,13 +136,22 @@ final class ASRService: NSObject, ObservableObject {
         partialTranscript = ""
         isRecording = true
 
-        task = recognizer.recognitionTask(with: req) { [weak self] result, error in
+        // Same @Sendable reasoning as the audio tap above — Speech
+        // framework fires this callback on its own queue, and the
+        // enclosing class is @MainActor. The body already hops back to
+        // MainActor via `Task { @MainActor in ... }` before touching
+        // state, so actual mutations remain isolated.
+        task = recognizer.recognitionTask(with: req) { @Sendable [weak self] result, error in
             guard let self else { return }
             if let result {
+                // Unpack into Sendable primitives BEFORE hopping actors —
+                // SFSpeechRecognitionResult is not Sendable, and Swift 6
+                // flags sending it into the @MainActor Task as a race.
                 let text = result.bestTranscription.formattedString
+                let isFinal = result.isFinal
                 Task { @MainActor in
                     self.partialTranscript = text
-                    if result.isFinal {
+                    if isFinal {
                         self.finalContinuation?.resume(returning: text)
                         self.finalContinuation = nil
                     }
@@ -145,13 +159,14 @@ final class ASRService: NSObject, ObservableObject {
                 return
             }
             if let error {
+                let message = error.localizedDescription
                 Task { @MainActor in
                     // The Speech framework emits one "cancelled" error if we
                     // tear down before the final result lands. Treat that as
                     // an empty transcript so the caller can decide whether to
                     // surface `noSpeechDetected` or proceed.
                     if self.finalContinuation != nil {
-                        self.finalContinuation?.resume(throwing: ASRError.audioEngineFailed(error.localizedDescription))
+                        self.finalContinuation?.resume(throwing: ASRError.audioEngineFailed(message))
                         self.finalContinuation = nil
                     }
                 }
