@@ -73,7 +73,56 @@ jobs:
         run: swift build
 
       - name: Test
-        run: swift test --parallel
+        # --enable-code-coverage only on the "16" cell — coverage output is
+        # identical across Xcode patch levels (same Swift 6.x compiler), so
+        # running it on both matrix cells would just duplicate a ~30 KB
+        # LCOV artifact. Text summary below parses llvm-cov's stdout so the
+        # PR log shows a one-liner per source file without the reviewer
+        # having to download the artifact.
+        run: |
+          if [ "${{ matrix.xcode }}" = "16" ]; then
+            swift test --parallel --enable-code-coverage
+          else
+            swift test --parallel
+          fi
+
+      - name: Export iOS SDK coverage (LCOV + text summary)
+        # Only runs on the "16" cell (see `if:` below). Skipped on 16.1 so
+        # we don't fight over artifact names in the matrix.
+        if: ${{ matrix.xcode == '16' }}
+        run: |
+          set -euo pipefail
+          BIN=".build/arm64-apple-macosx/debug/EdgeProbePackageTests.xctest/Contents/MacOS/EdgeProbePackageTests"
+          PROF=".build/arm64-apple-macosx/debug/codecov/default.profdata"
+          if [ ! -f "$PROF" ]; then
+            echo "No profdata at $PROF — did --enable-code-coverage run?"
+            exit 1
+          fi
+          mkdir -p coverage
+          # Exclude generated Swift Testing runners and test sources —
+          # coverage of TEST code isn't meaningful. The regex matches
+          # `.build/` (derived sources) and `Tests/` (the XCTest/Testing
+          # targets). Keep Sources/EdgeProbe/*.
+          xcrun llvm-cov export "$BIN" \
+            -instr-profile "$PROF" \
+            -format=lcov \
+            -ignore-filename-regex='.build|Tests|Fixtures' \
+            > coverage/lcov.info
+          echo "── iOS SDK coverage summary ──────────────"
+          xcrun llvm-cov report "$BIN" \
+            -instr-profile "$PROF" \
+            -ignore-filename-regex='.build|Tests|Fixtures' \
+            | tee coverage/summary.txt
+          echo "──────────────────────────────────────────"
+
+      - name: Upload iOS SDK coverage artifact
+        if: ${{ matrix.xcode == '16' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-ios-sdk
+          path: ios/coverage/
+          retention-days: 14
+          if-no-files-found: error
 
       - name: VoiceProbe stub reply stability (Slice 10)
         # Compiles ios/DemoApp/Sources/Services/SimulatorStubReply.swift
@@ -105,8 +154,21 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
-      - name: Test
-        run: bun test
+      - name: Test (with coverage)
+        # Both text + lcov reporters — text lands in the PR log for
+        # scanability, lcov lands on disk for the artifact + any downstream
+        # Codecov/Coveralls integration later. Slice 14 ships observability
+        # only; threshold gating is a follow-up once the baseline numbers
+        # have run for a week without surprise red cells.
+        run: bun test --coverage --coverage-reporter=text --coverage-reporter=lcov
+
+      - name: Upload backend coverage artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-backend
+          path: backend/coverage/
+          retention-days: 14
+          if-no-files-found: error
 
   web:
     name: Web — bun test + typecheck
@@ -129,8 +191,17 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
-      - name: Test
-        run: bun test
+      - name: Test (with coverage)
+        # See `backend` job for the reporter choice rationale.
+        run: bun test --coverage --coverage-reporter=text --coverage-reporter=lcov
+
+      - name: Upload web coverage artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-web
+          path: web/coverage/
+          retention-days: 14
+          if-no-files-found: error
 
   action:
     name: Action — bun test + typecheck + golden fixtures
@@ -160,8 +231,17 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
-      - name: Test
-        run: bun test
+      - name: Test (with coverage)
+        # See `backend` job for the reporter choice rationale.
+        run: bun test --coverage --coverage-reporter=text --coverage-reporter=lcov
+
+      - name: Upload action coverage artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-action
+          path: action/coverage/
+          retention-days: 14
+          if-no-files-found: error
 
       - name: Self-invoke on fixture (dry-run, verifies action.yml wiring)
         run: |
