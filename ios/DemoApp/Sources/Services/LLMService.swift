@@ -34,11 +34,12 @@ import MLXLMCommon
 import CoreML
 import Tokenizers  // Tokenizer, AutoTokenizer
 
-// llama.cpp simulator LLM path (Slice 11), opt-in via
-// `-EDGEPROBE_SIM_LLAMACPP`. Pure Swift wrapper around upstream
-// llama.cpp's xcframework — see ios/LlamaRuntime. CPU-only on sim
-// (forces n_gpu_layers = 0 internally), so no Metal and no
-// zero-logit CoreML bug. Works on iOS 16.4+ unlike the CoreML path.
+// llama.cpp simulator LLM path (Slice 11). Default sim backend as of
+// 2026-04-18; opt out via `-EDGEPROBE_SIM_STUB` for UI dev / CI / offline.
+// Pure Swift wrapper around upstream llama.cpp's xcframework — see
+// ios/LlamaRuntime. CPU-only on sim (forces n_gpu_layers = 0 internally),
+// so no Metal and no zero-logit CoreML bug. Works on iOS 16.4+ unlike
+// the CoreML path.
 import LlamaRuntime
 #endif
 
@@ -48,18 +49,19 @@ import LlamaRuntime
 ///     MLX-Swift, model = `Llama-3.2-1B-Instruct-4bit` from HuggingFace.
 ///     ~700 MB weights, fetched once and cached in the app container.
 ///
-///   • **Simulator, default**: deterministic stub. `load()` fakes a
-///     download animation; `generate()` echoes a short version of the
-///     prompt with ~600ms of synthetic latency so the trace waterfall
-///     looks plausible. No network, no weights. Used by UI dev, CI smoke
-///     tests, and anywhere a real LLM isn't strictly needed.
+///   • **Simulator, default: llama.cpp** (Slice 11; default since
+///     2026-04-18): real on-device LLM via upstream llama.cpp's
+///     xcframework. Model = `Qwen/Qwen2.5-0.5B-Instruct-GGUF` → the q4_0
+///     quantization (~428 MB). CPU-only on sim (the wrapper forces
+///     `n_gpu_layers = 0`), so no Metal dependency and no CoreML
+///     zero-logit bug. This is what a fresh clone gets on first launch.
 ///
-///   • **Simulator, opt-in: llama.cpp** (`-EDGEPROBE_SIM_LLAMACPP`,
-///     Slice 11): real on-device LLM via upstream llama.cpp's xcframework.
-///     Model = `Qwen/Qwen2.5-0.5B-Instruct-GGUF` → the q4_0 quantization
-///     (~428 MB). CPU-only on sim (the wrapper forces `n_gpu_layers = 0`),
-///     so no Metal dependency and no CoreML zero-logit bug. This is the
-///     path that actually runs real inference for simulator benchmarks.
+///   • **Simulator, opt-out: stub** (`-EDGEPROBE_SIM_STUB`): deterministic
+///     canned reply. `load()` fakes a download animation; `generate()`
+///     echoes a short version of the prompt with ~600ms of synthetic
+///     latency so the trace waterfall looks plausible. No network, no
+///     weights. Flip this when you're iterating on UI, running CI smoke
+///     tests, or need the demo to work offline without a 428 MB download.
 ///
 ///   • **Simulator, opt-in: CoreML** (`-EDGEPROBE_SIM_COREML`):
 ///     CoreML path against `finnvoorhees/coreml-SmolLM2-360M-Instruct-4bit`
@@ -70,8 +72,8 @@ import LlamaRuntime
 ///     simulator/CoreML fixes or model swaps can re-enable it with one
 ///     launch arg rather than a revert.
 ///
-/// Flag precedence: `-EDGEPROBE_SIM_LLAMACPP` beats
-/// `-EDGEPROBE_SIM_COREML` if both are set. Neither flag → stub.
+/// Flag precedence: `-EDGEPROBE_SIM_STUB` beats `-EDGEPROBE_SIM_COREML`
+/// if both are set. Neither flag → llama.cpp (default).
 ///
 /// Why the split:
 ///   MLX requires Metal-for-compute, which iOS simulators don't expose —
@@ -120,38 +122,48 @@ final class LLMService: ObservableObject {
 
     /// Written into the trace's span attributes so `gen_ai.request.model`
     /// in the dashboard reflects what actually ran. Device and the sim
-    /// stub pre-seed this; the sim CoreML path overwrites on successful
-    /// load (if someone flipped `-EDGEPROBE_SIM_COREML`). Dashboards
-    /// filtering on `gen_ai.request.model` will see three distinct values.
+    /// llama.cpp path pre-seed this; the sim CoreML and sim stub paths
+    /// overwrite on successful load (when their respective opt-in/opt-out
+    /// flags are flipped). Dashboards filtering on `gen_ai.request.model`
+    /// will see three distinct simulator values plus one device value.
+    ///
+    /// Simulator default is `qwen2.5-0.5b-instruct-q4-llamacpp` — real
+    /// inference is the default sim path as of 2026-04-18, replacing the
+    /// old stub default. Flip `-EDGEPROBE_SIM_STUB` on the scheme to opt
+    /// back to the canned-reply path for UI dev / CI / offline demos.
     #if targetEnvironment(simulator)
-    @Published private(set) var modelName: String = "stub-sim-llm"
+    @Published private(set) var modelName: String = "qwen2.5-0.5b-instruct-q4-llamacpp"
     #else
     @Published private(set) var modelName: String = "llama-3.2-1b-instruct-4bit-mlx"
     #endif
 
     #if targetEnvironment(simulator)
-    /// True only when `-EDGEPROBE_SIM_COREML` is on the launch-arg list.
+    /// True only when `-EDGEPROBE_SIM_STUB` is on the launch-arg list.
     /// Captured once at init so flipping ProcessInfo mid-run can't change
     /// the branch partway through a session — the user deserves a stable
     /// contract for "which backend am I observing?" within one app launch.
     ///
-    /// When false (the default): `load()` fakes progress + flips isLoaded
-    /// with no network; `generate()` returns a canned stub reply. When
-    /// true: the full CoreML MLModel + MLState driver below runs, same as
-    /// it did before the default changed.
+    /// When false (the default): `load()` downloads + mmaps the Qwen q4_0
+    /// GGUF (~428 MB first time, cached after) and `generate()` runs real
+    /// llama.cpp inference on simulator CPU. When true: `load()` fakes a
+    /// ~600ms progress animation with no network; `generate()` returns a
+    /// canned stub reply formatted by `SimulatorStubReply.text(for:)`.
+    /// Flip this for UI dev loops, offline demos, and the CI smoke path
+    /// that can't tolerate a multi-hundred-MB download.
+    private nonisolated let simStubEnabled: Bool =
+        ProcessInfo.processInfo.arguments.contains("-EDGEPROBE_SIM_STUB")
+
+    /// True only when `-EDGEPROBE_SIM_COREML` is on the launch-arg list.
+    /// Same capture-once-at-init discipline as `simStubEnabled`.
+    ///
+    /// Opt-in path preserved for Apple-fix re-test / swap-in of a
+    /// non-int4 non-stateful CoreML LLM. Currently surfaces the
+    /// sim-CPU zero-logit bug as a thrown error on first generate —
+    /// see class doc and `ios/DemoApp/README.md` for the write-up.
+    /// When both `-EDGEPROBE_SIM_STUB` and `-EDGEPROBE_SIM_COREML`
+    /// are set, stub wins (it's the "don't do anything heavy" flag).
     private nonisolated let simCoreMLEnabled: Bool =
         ProcessInfo.processInfo.arguments.contains("-EDGEPROBE_SIM_COREML")
-
-    /// True only when `-EDGEPROBE_SIM_LLAMACPP` is on the launch-arg list.
-    /// Same capture-once-at-init discipline as `simCoreMLEnabled`.
-    ///
-    /// This flag wins over `simCoreMLEnabled` if both are set: llama.cpp
-    /// is the path we recommend when someone actually wants real
-    /// inference on simulator, so ordering it first in the dispatcher
-    /// keeps the mental model simple ("llamacpp if I flipped it, else
-    /// the older flag if I flipped that, else stub").
-    private nonisolated let simLlamaCppEnabled: Bool =
-        ProcessInfo.processInfo.arguments.contains("-EDGEPROBE_SIM_LLAMACPP")
     #endif
 
     // MARK: - Device-only state
@@ -233,19 +245,18 @@ final class LLMService: ObservableObject {
         llmLog.info("load() starting")
 
         #if targetEnvironment(simulator)
-        if simLlamaCppEnabled {
-            // Opt-in path (Slice 11). Real inference via llama.cpp on
-            // sim CPU. Downloads ~428 MB of GGUF the first time.
-            do {
-                try await loadSimulatorLlamaCpp()
-                llmLog.info("load() simulator llama.cpp path succeeded (opt-in)")
-            } catch {
-                llmLog.error("load() simulator llama.cpp path failed: \(error.localizedDescription, privacy: .public)")
-                throw error
-            }
+        if simStubEnabled {
+            // Opt-out path. No network, no weights. ~600ms of fake
+            // progress so the chip still animates; used by UI dev,
+            // offline demos, and the CI smoke path that can't pay
+            // a multi-hundred-MB download on every run.
+            await loadSimulatorStub()
+            llmLog.info("load() simulator stub path succeeded (opt-out via -EDGEPROBE_SIM_STUB)")
         } else if simCoreMLEnabled {
-            // Opt-in path (not default). Fully functional download +
-            // MLModel load; inference outputs zeros — see class doc.
+            // Opt-in path. Fully functional download + MLModel load;
+            // inference throws inferenceFailed on the first predict due
+            // to the sim-CPU zero-logit bug — see class doc. Kept so a
+            // future Apple fix is one launch-arg flip to re-test.
             do {
                 try await loadSimulatorCoreML()
                 llmLog.info("load() simulator CoreML path succeeded (opt-in)")
@@ -254,12 +265,18 @@ final class LLMService: ObservableObject {
                 throw error
             }
         } else {
-            // Default path. No network, no weights. ~600ms of fake
-            // progress so the chip still animates; the UX matters more
-            // for a demo app than the microbenchmark realism we lose
-            // here. When the CoreML sim bug is resolved, flip the flag.
-            await loadSimulatorStub()
-            llmLog.info("load() simulator stub path succeeded")
+            // Default path (Slice 11+, default as of 2026-04-18).
+            // Real inference via llama.cpp on sim CPU — downloads
+            // ~428 MB of Qwen q4_0 GGUF the first time, cached after.
+            // No Metal (so no MLX sim abort) and no CoreML (so no
+            // zero-logit bug). This is what a fresh clone gets.
+            do {
+                try await loadSimulatorLlamaCpp()
+                llmLog.info("load() simulator llama.cpp path succeeded (default)")
+            } catch {
+                llmLog.error("load() simulator llama.cpp path failed: \(error.localizedDescription, privacy: .public)")
+                throw error
+            }
         }
         #else
         do {
@@ -433,19 +450,20 @@ final class LLMService: ObservableObject {
     /// better than it is.
     func generate(_ prompt: String) async throws -> String {
         #if targetEnvironment(simulator)
-        if simLlamaCppEnabled {
-            return try await generateSimulatorLlamaCpp(prompt)
+        if simStubEnabled {
+            return try await generateSimulatorStub(prompt)
         }
         if simCoreMLEnabled {
             return try await generateSimulatorCoreML(prompt)
         }
-        return try await generateSimulatorStub(prompt)
+        // Default: llama.cpp.
+        return try await generateSimulatorLlamaCpp(prompt)
         #else
         return try await generateDeviceMLX(prompt)
         #endif
     }
 
-    // MARK: - Simulator path (default: stub)
+    // MARK: - Simulator path (opt-out: stub via -EDGEPROBE_SIM_STUB)
 
     #if targetEnvironment(simulator)
     /// Fake the download animation so UI dev + recorded demos see the

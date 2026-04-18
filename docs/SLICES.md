@@ -231,11 +231,13 @@ failure modes unblocks everything without waiting on Apple.
   small — no streaming, no Config knobs, greedy sampling only. Lives
   outside `ios/` SDK so backend/CI consumers don't pay the 169 MB
   binaryTarget download cost.
-- VoiceProbe: third simulator LLM path opt-in via
-  `-EDGEPROBE_SIM_LLAMACPP`. Wins over `-EDGEPROBE_SIM_COREML` if both
-  set. Downloads `Qwen/Qwen2.5-0.5B-Instruct-GGUF` (q4_0, ~428 MB) on
-  first launch via `HubApi.snapshot`; caches afterwards. Forces
-  `n_gpu_layers = 0` so no Metal dep.
+- VoiceProbe: third simulator LLM path, shipped opt-in via
+  `-EDGEPROBE_SIM_LLAMACPP` and promoted to simulator default on
+  2026-04-18 (stub moved to opt-out via `-EDGEPROBE_SIM_STUB`, CoreML
+  remains opt-in via `-EDGEPROBE_SIM_COREML`). Downloads
+  `Qwen/Qwen2.5-0.5B-Instruct-GGUF` (q4_0, ~428 MB) on first launch
+  via `HubApi.snapshot`; caches afterwards. Forces `n_gpu_layers = 0`
+  so no Metal dep.
 - `ModelHub.swift`: new `ensureLlamaCppGGUF(progress:)` helper,
   ungated (llama.cpp works on iOS 16.4+; `ensureAvailable` stays
   `@available(iOS 18.0, *)` for the CoreML path).
@@ -246,6 +248,7 @@ failure modes unblocks everything without waiting on Apple.
 
 **Done:** VoiceProbe built for simulator links `llama.framework` into
 the `.app`, `swift test` in `ios/LlamaRuntime` passes 3/3 (error
-descriptions, missing-file throw, raw C-symbol import), and flipping
-`-EDGEPROBE_SIM_LLAMACPP` on the scheme produces model-generated tokens
-(not stub text) after the first-launch download.
+descriptions, missing-file throw, raw C-symbol import), and a fresh
+simulator launch produces model-generated tokens (not stub text)
+after the first-launch Qwen GGUF download — no launch arg required
+as of 2026-04-18.

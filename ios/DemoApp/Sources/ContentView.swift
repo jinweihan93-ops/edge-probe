@@ -158,10 +158,10 @@ struct ContentView: View {
     /// coming down rather than a CoreML snapshot.
     ///
     /// Strings must match `LLMService.modelName` assignments exactly:
-    ///   • `stub-sim-llm`                          → sim stub
-    ///   • `qwen2.5-0.5b-instruct-q4-llamacpp`     → sim llama.cpp (Slice 11)
+    ///   • `qwen2.5-0.5b-instruct-q4-llamacpp`     → sim llama.cpp (default)
+    ///   • `stub-sim-llm`                          → sim stub (`-EDGEPROBE_SIM_STUB`)
     ///   • `llama-3.2-1b-instruct-4bit-mlx`        → device MLX
-    ///   • (CoreML path doesn't rename — keeps the MLX default on sim)
+    ///   • (CoreML opt-in path doesn't rename — keeps the MLX default on sim)
     private var loadProgressLabel: String {
         let pct = Int(llm.loadProgress * 100)
         switch llm.modelName {

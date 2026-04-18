@@ -21,8 +21,9 @@ import llama
 ///     C API propagate as a force-unwrap crash.
 ///
 /// End-to-end "generate from real weights" lives in VoiceProbe itself:
-/// flip `-EDGEPROBE_SIM_LLAMACPP` on the scheme, hit Run, talk. The
-/// voice turn IS the integration test.
+/// run VoiceProbe on simulator (llama.cpp is the default backend as of
+/// 2026-04-18 — no launch arg needed), hit Run, talk. The voice turn
+/// IS the integration test.
 final class LlamaRuntimeTests: XCTestCase {
 
     /// Covers every error case in the switch statement. If someone

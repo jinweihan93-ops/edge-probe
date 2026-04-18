@@ -71,11 +71,11 @@ cd web && bun install && bun test
 | Environment | Backend | Model | Download |
 |-------------|---------|-------|----------|
 | Device | MLX-Swift | Llama-3.2-1B-Instruct-4bit | ~700 MB |
-| Simulator (default) | Stub | deterministic canned reply | 0 |
-| Simulator + `-EDGEPROBE_SIM_LLAMACPP` | llama.cpp | Qwen2.5-0.5B-Instruct-q4_0 | ~428 MB |
+| Simulator (default) | llama.cpp | Qwen2.5-0.5B-Instruct-q4_0 | ~428 MB |
+| Simulator + `-EDGEPROBE_SIM_STUB` | Stub | deterministic canned reply | 0 |
 | Simulator + `-EDGEPROBE_SIM_COREML` | CoreML | SmolLM2-360M-Instruct-4bit | ~210 MB |
 
-First launch downloads the model from HuggingFace Hub; subsequent launches hit the on-device cache.
+First launch downloads the model from HuggingFace Hub; subsequent launches hit the on-device cache. Flip `-EDGEPROBE_SIM_STUB` when you need the demo to run offline or want to skip the 428 MB download.
 
 Full setup, launch-arg reference, and the simulator-specific known issues are in **`ios/DemoApp/README.md`**.
 
@@ -166,11 +166,11 @@ cd web && bun install && bun test
 | 运行环境 | 后端 | 模型 | 下载体积 |
 |----------|------|------|----------|
 | 真机 | MLX-Swift | Llama-3.2-1B-Instruct-4bit | ~700 MB |
-| 模拟器（默认） | Stub | 固定 canned 回复 | 0 |
-| 模拟器 + `-EDGEPROBE_SIM_LLAMACPP` | llama.cpp | Qwen2.5-0.5B-Instruct-q4_0 | ~428 MB |
+| 模拟器（默认） | llama.cpp | Qwen2.5-0.5B-Instruct-q4_0 | ~428 MB |
+| 模拟器 + `-EDGEPROBE_SIM_STUB` | Stub | 固定 canned 回复 | 0 |
 | 模拟器 + `-EDGEPROBE_SIM_COREML` | CoreML | SmolLM2-360M-Instruct-4bit | ~210 MB |
 
-首次启动从 HuggingFace Hub 下载模型，之后命中设备本地缓存。
+首次启动从 HuggingFace Hub 下载模型，之后命中设备本地缓存。需要离线跑或想跳过 428 MB 首次下载时，加上 `-EDGEPROBE_SIM_STUB` 即可。
 
 完整的启动参数、环境配置、模拟器相关的已知问题详见 **`ios/DemoApp/README.md`**。
 

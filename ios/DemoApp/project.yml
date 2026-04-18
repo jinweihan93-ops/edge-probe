@@ -23,9 +23,11 @@ packages:
   # XCFramework. Lives in a sibling SwiftPM package (`../LlamaRuntime`)
   # rather than being folded into EdgeProbe so backend/CI consumers of
   # the SDK don't pay the 169 MB binaryTarget download. VoiceProbe uses
-  # it only on simulator under the `-EDGEPROBE_SIM_LLAMACPP` launch
-  # arg — a real on-device GGUF-backed LLM path that bypasses the
-  # CoreML zero-logit bug described in the VoiceProbe README.
+  # it as the DEFAULT simulator LLM backend as of 2026-04-18 — a real
+  # on-device GGUF-backed LLM path that bypasses the CoreML zero-logit
+  # bug described in the VoiceProbe README. Opt out to the 600 ms canned
+  # stub via the `-EDGEPROBE_SIM_STUB` launch arg when you don't want
+  # the 428 MB first-launch download (UI dev / CI / offline demos).
   LlamaRuntime:
     path: ../LlamaRuntime
   mlx-swift-examples:
@@ -46,9 +48,10 @@ packages:
     # SmolLM2 export (snake_case `input_ids` / `causal_mask`), so we bypass
     # it. iOS 18 runtime guard is applied at the call sites.
     #
-    # The `-EDGEPROBE_SIM_LLAMACPP` path (Slice 11) also uses `HubApi`
-    # from this package to pull a GGUF file from Qwen's HF repo — we
-    # reuse swift-transformers rather than hand-rolling a downloader.
+    # The default simulator path (llama.cpp / Slice 11) also uses
+    # `HubApi` from this package to pull a GGUF file from Qwen's HF
+    # repo — we reuse swift-transformers rather than hand-rolling a
+    # downloader.
     from: "1.0.0"
 
 targets:
@@ -112,17 +115,19 @@ targets:
       # still pay the link cost for these, but the code behind them is
       # all gated by `#if targetEnvironment(simulator)` so nothing
       # executes on device. Within sim, the path is further gated by the
-      # `-EDGEPROBE_SIM_COREML` launch arg; default sim builds use a
-      # stub that doesn't touch either symbol. See README VoiceProbe
-      # section for why the default is the stub.
+      # `-EDGEPROBE_SIM_COREML` launch arg; default sim builds run
+      # llama.cpp and don't touch either symbol. `Hub` is also used by
+      # the default llama.cpp path for the GGUF download, so this
+      # dependency isn't CoreML-only.
       - package: swift-transformers
         product: Transformers
       - package: swift-transformers
         product: Hub
-      # llama.cpp simulator LLM (Slice 11). Only referenced from code
-      # behind `#if targetEnvironment(simulator)` and further gated by
-      # the `-EDGEPROBE_SIM_LLAMACPP` launch arg. Device builds link it
-      # but never execute it; the xcframework dead-strips easily since
-      # no device-path code touches any LlamaRuntime symbol.
+      # llama.cpp simulator LLM (Slice 11). Default simulator backend
+      # as of 2026-04-18. Only referenced from code behind
+      # `#if targetEnvironment(simulator)`; device builds link it but
+      # never execute it, and the xcframework dead-strips easily since
+      # no device-path code touches any LlamaRuntime symbol. Opt out
+      # to the stub via `-EDGEPROBE_SIM_STUB` on the scheme.
       - package: LlamaRuntime
         product: LlamaRuntime

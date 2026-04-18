@@ -23,7 +23,8 @@ import Hub
 ///      Total: ~210 MB. Currently hits the sim-CPU zero-logit bug — see
 ///      LLMService class docs.
 ///
-///   2. **llama.cpp** (opt-in `-EDGEPROBE_SIM_LLAMACPP`, Slice 11) — via
+///   2. **llama.cpp** (default simulator backend since 2026-04-18;
+///      opt out to stub via `-EDGEPROBE_SIM_STUB`, Slice 11) — via
 ///      `ensureLlamaCppGGUF(progress:)`. Single file:
 ///         • `Qwen/Qwen2.5-0.5B-Instruct-GGUF` →
 ///           `qwen2.5-0.5b-instruct-q4_0.gguf` (~428 MB).

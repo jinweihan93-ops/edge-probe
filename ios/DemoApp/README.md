@@ -21,13 +21,13 @@ identical regardless of which backend is live.
 | Environment                            | Backend            | `modelName` (in `gen_ai.request.model`)      | Size    | First-launch I/O              |
 |----------------------------------------|--------------------|----------------------------------------------|---------|-------------------------------|
 | Device (iPhone)                        | MLX-Swift          | `llama-3.2-1b-instruct-4bit-mlx`             | ~700 MB | HuggingFace Hub download      |
-| Simulator, **default**                 | Deterministic stub | `stub-sim-llm`                               | 0       | None — pure in-process        |
-| Simulator, `-EDGEPROBE_SIM_LLAMACPP`   | llama.cpp          | `qwen2.5-0.5b-instruct-q4-llamacpp`          | ~428 MB | HuggingFace Hub download      |
+| Simulator, **default**                 | llama.cpp          | `qwen2.5-0.5b-instruct-q4-llamacpp`          | ~428 MB | HuggingFace Hub download      |
+| Simulator, `-EDGEPROBE_SIM_STUB`       | Deterministic stub | `stub-sim-llm`                               | 0       | None — pure in-process        |
 | Simulator, `-EDGEPROBE_SIM_COREML`     | CoreML             | `coreml-smollm2-360m-instruct-4bit`          | ~210 MB | HuggingFace Hub download      |
 
-If both `-EDGEPROBE_SIM_LLAMACPP` and `-EDGEPROBE_SIM_COREML` are set,
-llama.cpp wins — it's the path that actually produces inference on
-simulator (the CoreML one currently hits a sim-CPU bug, see below).
+If both `-EDGEPROBE_SIM_STUB` and `-EDGEPROBE_SIM_COREML` are set, stub
+wins — it's the "don't do anything heavy" flag, so anyone who flips it
+has explicitly chosen the no-network path.
 
 The dashboard can filter on `gen_ai.request.model`, so a mixed bench run
 produces four distinct rows — no accidental apples-to-oranges.
@@ -39,14 +39,8 @@ touch `MLX.GPU` and the process abort()s inside
 `mlx::core::metal::Device::Device`. So simulator cannot use the same
 engine as device, period.
 
-The default simulator path is a deterministic stub: `load()` fakes a
-~600 ms progress animation, `generate()` echoes a 60-char preview of the
-prompt wrapped in a stable template (`SimulatorStubReply.swift`). Zero
-network, zero weights, plausible LLM span latency (~600 ms) on the
-dashboard. Good for UI dev, recorded demos, and CI smoke.
-
-The llama.cpp simulator path (`-EDGEPROBE_SIM_LLAMACPP`, Slice 11) runs
-a real Qwen2.5-0.5B-Instruct-q4_0 GGUF through
+The default simulator path (Slice 11, default since 2026-04-18) runs a
+real Qwen2.5-0.5B-Instruct-q4_0 GGUF through
 [upstream llama.cpp](https://github.com/ggml-org/llama.cpp)'s prebuilt
 xcframework. Wrapper lives in `ios/LlamaRuntime` — a sibling SwiftPM
 package that pins the xcframework by URL + SHA-256 checksum. CPU-only
@@ -54,17 +48,25 @@ on sim (the wrapper forces `n_gpu_layers = 0`) so there's no Metal
 dependency; same binary code runs unchanged on device, iOS 16.4+. First
 launch downloads ~428 MB from the
 [Qwen/Qwen2.5-0.5B-Instruct-GGUF](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF)
-repo; subsequent launches hit the local cache. This is the path to use
-when you want real on-device benchmark numbers from a simulator.
+repo; subsequent launches hit the local cache. The deterministic greedy
+sampling makes simulator benchmark latency reproducible across runs.
+
+The stub opt-out path (`-EDGEPROBE_SIM_STUB`) keeps the old pre-Slice-11
+behavior around: `load()` fakes a ~600 ms progress animation,
+`generate()` echoes a 60-char preview of the prompt wrapped in a stable
+template (`SimulatorStubReply.swift`). Zero network, zero weights,
+plausible LLM span latency (~600 ms) on the dashboard. Flip this when
+UI dev / recorded demos / CI smoke can't pay a 428 MB first-launch
+download, or when you need the demo to run offline.
 
 The CoreML simulator path (`-EDGEPROBE_SIM_COREML`) drives a real CoreML
 SmolLM2-360M-Instruct against `MLModel` + `MLState` directly. It
 currently surfaces an all-zero-logits bug on simulator CPU (see the
 top-level `README.md` forensic write-up) and throws
 `LLMError.inferenceFailed` on the first `generate()`. Kept in the tree
-so a future Apple fix is one launch-arg away, not a revert. If you want
-actual inference on simulator today, prefer `-EDGEPROBE_SIM_LLAMACPP`
-over this one.
+so a future Apple fix is one launch-arg away, not a revert. There's
+almost no reason to flip this today — it was kept as an opt-in gate
+for regression-testing Apple's sim CPU CoreML backend.
 
 ## What you need
 
@@ -110,15 +112,17 @@ open VoiceProbe.xcodeproj
 
 Hit **Run**. What happens next depends on target:
 
-- **Simulator (default):** the chip shows `Warming stub 10%…100%` over
-  ~600 ms, then flips to `stub-sim-llm`. No download. Mic works.
-  Replies are canned but the trace waterfall is real.
-- **Simulator + `-EDGEPROBE_SIM_LLAMACPP`:** chip shows
-  `Downloading Qwen GGUF X%` for the ~428 MB pull from HuggingFace,
-  then flips to `qwen2.5-0.5b-instruct-q4-llamacpp`. Real inference
-  runs on sim CPU — expect ~1–2s per 128-token reply on an M-series
-  Mac. Same generated text every time (greedy sampling) so benchmarks
-  are deterministic.
+- **Simulator (default):** chip shows `Downloading Qwen GGUF X%` for
+  the ~428 MB pull from HuggingFace, then flips to
+  `qwen2.5-0.5b-instruct-q4-llamacpp`. Real inference runs on sim CPU
+  — expect ~1–2s per 128-token reply on an M-series Mac. Same
+  generated text every time (greedy sampling) so benchmarks are
+  deterministic. Subsequent launches hit the local cache.
+- **Simulator + `-EDGEPROBE_SIM_STUB`:** chip shows
+  `Warming stub 10%…100%` over ~600 ms, then flips to `stub-sim-llm`.
+  No download. Mic works. Replies are canned but the trace waterfall
+  is real. Use this when you're iterating on UI or the network is
+  unreliable.
 - **Simulator + `-EDGEPROBE_SIM_COREML`:** chip shows `Downloading
   X%` for the ~210 MB SmolLM2 pull, then the CoreML model loads and
   throws on first generate (zero-logit sim bug). Dev tool for
@@ -144,13 +148,15 @@ The `project.yml` already allows cleartext loopback via
 ## What to try
 
 1. Tap **Load model** (or just wait if `-EDGEPROBE_AUTOLOAD` is set).
-   Chip transitions through progress → `Ready` (device/sim-CoreML) or
-   `Warming stub 10%…100%` → `stub-sim-llm` (sim default).
+   Chip transitions through progress → `Ready`. On simulator default
+   that's `Downloading Qwen GGUF X%` → `qwen2.5-0.5b-instruct-q4-llamacpp`;
+   with `-EDGEPROBE_SIM_STUB` it's `Warming stub 10%…100%` → `stub-sim-llm`.
 2. Hold the mic. Ask something short ("what's the weather on Mars").
 3. Release. ASR finalizes, the LLM answers (or stub-echoes), the phone
    speaks.
 4. Three timing chips appear — `ASR 320ms · LLM 980ms · TTS 210ms` on
-   device; `ASR 320ms · LLM 600ms · TTS 210ms` on sim stub.
+   device; `ASR 320ms · LLM ~1200ms · TTS 210ms` on sim default (Qwen on
+   sim CPU); `ASR 320ms · LLM 600ms · TTS 210ms` with `-EDGEPROBE_SIM_STUB`.
 5. Tap **Create share link**. The app calls
    `POST /app/trace/:id/share` and surfaces the `/r/<token>` URL in the
    system share sheet.
@@ -174,21 +180,22 @@ Off by default. All wired in `ContentView.task {}`.
   stdout. Use with `xcrun simctl launch --console-pty` for CI smoke
   and local benchmarking. `print()` not `OSLog` — the console pty
   capture doesn't pick up OSLog output.
-- **`-EDGEPROBE_SIM_LLAMACPP`** — simulator only. Opts into the real
-  llama.cpp LLM path (Qwen2.5-0.5B-Instruct-q4_0 GGUF, ~428 MB download
-  on first launch). This is the path to flip for real on-sim inference;
-  output is deterministic greedy-sampled, good for benchmark regressions.
+- **`-EDGEPROBE_SIM_STUB`** — simulator only. Opts OUT of the real
+  llama.cpp default to the 600 ms canned-reply stub. Zero network,
+  zero weights, deterministic reply text. Flip this when you're
+  iterating on UI, running offline, or want the CI smoke path to
+  skip the 428 MB first-launch download.
 - **`-EDGEPROBE_SIM_COREML`** — simulator only. Opts into the real
-  CoreML SmolLM2 LLM path instead of the default stub. Currently
+  CoreML SmolLM2 LLM path instead of the llama.cpp default. Currently
   surfaces the zero-logit failure as a thrown error on the first
   generate; useful for verifying Apple-side fixes or swapping in a
   different model (see class doc on `LLMService` for the swap points).
-  If you just want inference to work on simulator, prefer
-  `-EDGEPROBE_SIM_LLAMACPP` above.
+  If you just want inference to work on simulator, leave all sim
+  flags off — the default llama.cpp path handles that.
 
 ### The stub reply contract
 
-The default sim path's reply text is pinned by
+The stub opt-out path's reply text (`-EDGEPROBE_SIM_STUB`) is pinned by
 `SimulatorStubReply.text(for:)`. `scripts/voiceprobe-stub-smoke.sh`
 compiles that file against a driver that asserts on the canonical
 output for `"hello"` — it's checked in CI so the stub text can't
@@ -234,10 +241,17 @@ timings stay.
 - **Llama-3.2-1B-Instruct-4bit** (device): small enough for
   on-device, instruct-tuned so replies stay voice-friendly with a
   one-line system prompt.
-- **Simulator stub** (default): no model downloads, deterministic
-  reply text, ~600 ms synthetic latency. The demo's whole point isn't
-  model quality — it's showing EdgeProbe captures real on-device
-  behavior. The stub still exercises the SDK's full span pipeline.
+- **Qwen2.5-0.5B-Instruct-q4_0 via llama.cpp** (simulator default,
+  Slice 11): ~428 MB GGUF, pure-CPU inference on simulator via
+  upstream llama.cpp's xcframework. No Metal (so MLX's sim abort
+  doesn't apply), no CoreML (so the zero-logit bug doesn't apply),
+  deterministic greedy sampling. First real LLM the VoiceProbe demo
+  can run on simulator without hacks.
+- **Simulator stub** (opt-out via `-EDGEPROBE_SIM_STUB`): no model
+  downloads, deterministic reply text, ~600 ms synthetic latency. The
+  opt-out gate for UI dev / offline demos / CI smoke that can't tolerate
+  a multi-hundred-MB download on every run. Still exercises the SDK's
+  full span pipeline even though the reply is canned.
 - **SmolLM2-360M-Instruct-4bit** (simulator, CoreML, opt-in): a real
   small model that would be CI-benchmarkable if the simulator CPU
   backend weren't returning all-zero logits. Kept in the tree behind
