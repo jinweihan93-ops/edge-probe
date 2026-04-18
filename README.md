@@ -1,22 +1,57 @@
 # EdgeProbe
 
-On-device AI observability for iOS. OpenTelemetry-compatible SDK, trace viewer, CI regression detector.
+**On-device AI observability for iOS** — an OpenTelemetry-compatible SDK, a hosted trace viewer, and a CI regression detector.
+**面向 iOS 的端侧 AI 可观测性**—— 一个兼容 OpenTelemetry 的 SDK、一个托管的 trace 查看器、一个 CI 回归检测工具。
 
-**Status:** Year 2 P0 — initial scaffolding. Plan is CONDITIONAL pending gating (see `docs/PLAN.md`).
+[English](#english) · [中文](#中文)
 
-## Layout
+---
 
+## English
+
+### What is EdgeProbe?
+
+EdgeProbe gives you three things for AI features that run on the user's device:
+
+1. **A Swift SDK** that traces LLM / ASR / TTS / embedding calls in one line.
+2. **A hosted dashboard** that renders those traces as waterfalls, shareable via read-only public links.
+3. **A CI benchmark harness** that catches latency and quality regressions before they ship.
+
+Prompts and completions stay private by default. Public share links carry only timings and structure — never user content.
+
+### The three-line install
+
+```swift
+import EdgeProbe
+
+EdgeProbe.start(apiKey: "epk_pub_...")
+
+try EdgeProbe.trace(.llm) {
+    try model.generate(prompt)
+}
 ```
-ios/       Swift Package — EdgeProbe SDK (iOS 16+)
-backend/   Bun + Postgres — /ingest, /r/{token}, /app/trace/{id}
-web/       Dashboard — /app
-harness/   Benchmark CLI — `harness run` / `harness diff` (Y1 OSS tool)
-docs/      Plan, design system, architecture notes
-scripts/   Dev + CI helpers
-.github/   Workflows (XCFramework builds on llama.cpp tags, CI matrix)
-```
 
-## Quick start
+That's the whole pitch. The SDK captures the span, exports it to the backend, and the dashboard renders a waterfall trace.
+
+### Status
+
+Year 2 P0 — initial scaffolding. The full plan is CONDITIONAL pending gating (see `docs/PLAN.md`).
+
+### Project layout
+
+| Path | What lives here |
+|------|-----------------|
+| `ios/` | Swift Package — EdgeProbe SDK (iOS 16+) |
+| `ios/DemoApp/` | VoiceProbe — reference app exercising the full ASR → LLM → TTS loop |
+| `ios/LlamaRuntime/` | Sibling SwiftPM package wrapping llama.cpp for simulator inference |
+| `backend/` | Bun + Postgres — `/ingest`, `/r/{token}`, `/app/trace/{id}` |
+| `web/` | Dashboard — `/app` |
+| `harness/` | Benchmark CLI — `harness run` / `harness diff` (Y1 OSS tool) |
+| `docs/` | Plan, design system, architecture notes |
+| `scripts/` | Dev + CI helpers |
+| `.github/` | Workflows (XCFramework builds on llama.cpp tags, CI matrix) |
+
+### Quick start
 
 ```bash
 # iOS SDK
@@ -29,7 +64,57 @@ cd backend && bun install && bun test
 cd web && bun install && bun test
 ```
 
-## The three-line install (what we are building toward)
+### Reference demo: VoiceProbe
+
+`ios/DemoApp` is a full **ASR → LLM → TTS** voice loop with EdgeProbe wrapping each stage. The LLM backend has four paths depending on where you run it:
+
+| Environment | Backend | Model | Download |
+|-------------|---------|-------|----------|
+| Device | MLX-Swift | Llama-3.2-1B-Instruct-4bit | ~700 MB |
+| Simulator (default) | Stub | deterministic canned reply | 0 |
+| Simulator + `-EDGEPROBE_SIM_LLAMACPP` | llama.cpp | Qwen2.5-0.5B-Instruct-q4_0 | ~428 MB |
+| Simulator + `-EDGEPROBE_SIM_COREML` | CoreML | SmolLM2-360M-Instruct-4bit | ~210 MB |
+
+First launch downloads the model from HuggingFace Hub; subsequent launches hit the on-device cache.
+
+Full setup, launch-arg reference, and the simulator-specific known issues are in **`ios/DemoApp/README.md`**.
+
+### Documentation
+
+- **`docs/PLAN.md`** — Year 2 P0 strategy, architecture decisions, review reports
+- **`docs/DESIGN.md`** — color tokens, typography, components, forbidden patterns
+- **`docs/SLICES.md`** — shippable slice log (what's done, what's next)
+- **`docs/TEST-PLAN.md`** — testing strategy, critical regression paths
+
+### Critical invariants (never regress)
+
+1. Public share `/r/{token}` never renders prompt/completion text.
+2. Cross-org trace ID scan returns 403, not 404.
+3. Per-call `includeContent: true` does not escalate to public visibility.
+4. Main thread is never blocked by the SDK.
+5. SDK drops oldest span on buffer overflow; counter is emitted as a metric.
+6. `EdgeProbe.start()` is idempotent.
+
+### Advanced
+
+- **Benchmark harness** — `harness/` is a separate SwiftPM package that runs prompts through the SDK in dry-run mode. Source of truth for the monthly benchmark posts, and doubles as an SDK integration smoke. CLI usage lives under `harness/`.
+- **XCFramework builds** — `.github/workflows/xcframework.yml` fans out `{ios, ios-simulator, macos} × {arm64, x86_64}` builds on llama.cpp / whisper.cpp upstream tags. Local entry point: `scripts/build-xcframework.sh`.
+
+---
+
+## 中文
+
+### 这是什么？
+
+EdgeProbe 为运行在用户设备上的 AI 功能提供三件套：
+
+1. **Swift SDK** —— 一行代码即可追踪 LLM / ASR / TTS / embedding 调用。
+2. **托管 Dashboard** —— 把 trace 渲染成瀑布图，可通过只读公开链接分享。
+3. **CI 基准测试工具** —— 在发布之前捕获时延与质量回归。
+
+Prompt 与 completion 默认保留在设备上。公开分享链接只携带时延与结构信息，从不包含用户内容。
+
+### 三行代码接入
 
 ```swift
 import EdgeProbe
@@ -41,229 +126,71 @@ try EdgeProbe.trace(.llm) {
 }
 ```
 
-That is the whole pitch. The SDK captures the span, exports it to the backend, and the dashboard shows a waterfall trace. Public share URLs carry timings but never prompt/completion text.
+这就是全部。SDK 会捕获 span、上报到后端，Dashboard 自动渲染瀑布图。
 
-## Reference docs
+### 当前状态
 
-- **Plan:** `docs/PLAN.md` — Year 2 P0 strategy, architecture decisions, review reports
-- **Design system:** `docs/DESIGN.md` — color tokens, typography, components, forbidden patterns
-- **Critical regression paths:** see "Critical Paths" in `docs/TEST-PLAN.md` — six tests that gate ship
+Year 2 P0 —— 初始脚手架阶段。完整计划为 CONDITIONAL，等待 gating 触发（详见 `docs/PLAN.md`）。
 
-## Critical invariants (never regress)
+### 项目结构
 
-1. Public share `/r/{token}` never renders prompt/completion text
-2. Cross-org trace ID scan returns 403, not 404
-3. Per-call `includeContent: true` does not escalate to public visibility
-4. Main thread never blocked by SDK
-5. SDK drops oldest on buffer overflow, counter emitted as metric
-6. `EdgeProbe.start()` is idempotent
+| 路径 | 内容 |
+|------|------|
+| `ios/` | Swift Package —— EdgeProbe SDK（iOS 16+） |
+| `ios/DemoApp/` | VoiceProbe —— 演示完整 ASR → LLM → TTS 链路的参考 app |
+| `ios/LlamaRuntime/` | 包装 llama.cpp 的 SwiftPM 包，用于模拟器推理 |
+| `backend/` | Bun + Postgres —— `/ingest`、`/r/{token}`、`/app/trace/{id}` |
+| `web/` | Dashboard —— `/app` |
+| `harness/` | 基准测试 CLI —— `harness run` / `harness diff`（Y1 开源工具） |
+| `docs/` | 计划、设计系统、架构笔记 |
+| `scripts/` | 开发与 CI 辅助脚本 |
+| `.github/` | Workflows（跟随 llama.cpp tag 构建 XCFramework，CI 矩阵） |
 
-## Benchmark harness (`harness/`)
-
-Separate SwiftPM package with a `harness` executable + `harness run` / `harness
-diff` subcommands. Purpose per `docs/PLAN.md`: source-of-truth for the monthly
-benchmark posts (Y1 content) AND a reusable integration smoke for the SDK
-(Y2 SDK). Each iteration wraps its work in `EdgeProbe.beginTrace()` in
-dry-run mode, so the harness doubles as a span-pipeline exerciser.
+### 快速上手
 
 ```bash
-cd harness
+# iOS SDK
+cd ios && swift test
 
-# Run N iterations against a prompt fixture. Model IDs that don't match a
-# real model loader fall through to a deterministic synthetic path —
-# xorshift32 seeded by SHA(prompt) ⊕ modelId ⊕ iter — so goldens are
-# reproducible across machines and CI runs.
-swift run harness run \
-  --model mock-v1 \
-  --prompt Tests/harnessTests/Fixtures/prompts/cap.txt \
-  --iters 2
+# 后端
+cd backend && bun install && bun test
 
-# Compare two runs — PR-comment-shaped Markdown diff.
-swift run harness diff baseline.json this.json --threshold 0.15
-
-# Test suite (golden fixtures, error-path coverage, EdgeProbe smoke):
-swift test
+# Web
+cd web && bun install && bun test
 ```
 
-The output JSON schema (`TimingBlob`) is versioned. Schema changes MUST
-bump `schema: 1` in `Sources/harness/TimingBlob.swift` so downstream
-consumers — the GitHub Action's diff comment, external benchmark
-dashboards — detect format drift before they render bad numbers.
+### 参考 Demo：VoiceProbe
 
-## XCFramework builds (llama.cpp / whisper.cpp)
+`ios/DemoApp` 是一个完整的 **ASR → LLM → TTS** 语音 demo，每一段都被 EdgeProbe 包裹成 span。根据运行环境，LLM 后端有四条可选路径：
 
-The SDK's `Package.swift` will pin llama.cpp and whisper.cpp as
-`binaryTarget()` entries pointing at prebuilt XCFrameworks. Hand-building
-those across the `{ios, ios-simulator, macos} × {arm64, x86_64}` matrix
-every time upstream ships a tag is eng toil we want to pay down once.
+| 运行环境 | 后端 | 模型 | 下载体积 |
+|----------|------|------|----------|
+| 真机 | MLX-Swift | Llama-3.2-1B-Instruct-4bit | ~700 MB |
+| 模拟器（默认） | Stub | 固定 canned 回复 | 0 |
+| 模拟器 + `-EDGEPROBE_SIM_LLAMACPP` | llama.cpp | Qwen2.5-0.5B-Instruct-q4_0 | ~428 MB |
+| 模拟器 + `-EDGEPROBE_SIM_COREML` | CoreML | SmolLM2-360M-Instruct-4bit | ~210 MB |
 
-`.github/workflows/xcframework.yml` fans the matrix out on macOS runners,
-strips + lipos + zips the slices, and attaches them to a GitHub release
-named `xcframeworks-<llama-tag>-<whisper-tag>`. Two entrypoints:
+首次启动从 HuggingFace Hub 下载模型，之后命中设备本地缓存。
 
-**Manual (founder testing a new upstream tag):**
+完整的启动参数、环境配置、模拟器相关的已知问题详见 **`ios/DemoApp/README.md`**。
 
-```bash
-# Dry-run first — prints the build plan for each matrix cell without compiling.
-gh workflow run xcframework.yml \
-  -f llama_cpp_tag=b4321 \
-  -f whisper_cpp_tag=v1.7.2 \
-  -f dry_run=true
+### 文档
 
-# When ready, flip dry_run=false. Same invocation, compile + assemble + draft release.
-gh workflow run xcframework.yml \
-  -f llama_cpp_tag=b4321 \
-  -f whisper_cpp_tag=v1.7.2 \
-  -f dry_run=false
-```
+- **`docs/PLAN.md`** —— Year 2 P0 策略、架构决策、评审报告
+- **`docs/DESIGN.md`** —— 颜色 token、字体、组件、禁用模式
+- **`docs/SLICES.md`** —— 可交付 slice 日志（已完成 / 下一步）
+- **`docs/TEST-PLAN.md`** —— 测试策略与关键回归路径
 
-**Automated (watcher on upstream releases):**
+### 关键不变量（绝不回归）
 
-```bash
-# A cron or external watcher fires a repository_dispatch event. The workflow
-# builds real (not dry-run) on this path — unattended bumps land as draft
-# releases for review, never auto-published.
-gh api -X POST repos/:owner/:repo/dispatches \
-  -f event_type=llama-cpp-release \
-  -f client_payload[tag]=b4321
-```
+1. 公开分享链接 `/r/{token}` 永不渲染 prompt / completion 文本。
+2. 跨组织扫描 trace ID 返回 403，而不是 404。
+3. 单次调用 `includeContent: true` 不会升级为公开可见。
+4. SDK 永不阻塞主线程。
+5. 缓冲区溢出时丢弃最旧的 span，并通过指标上报丢弃计数。
+6. `EdgeProbe.start()` 可重复调用（幂等）。
 
-**Local sanity check:**
+### 进阶
 
-```bash
-# The workflow delegates all real work to scripts/build-xcframework.sh.
-# Running it locally with no --real prints the exact command list the
-# workflow would execute for that matrix cell.
-scripts/build-xcframework.sh --target ios --arch arm64 \
-  --llama-tag b4321 --whisper-tag v1.7.2
-
-scripts/build-xcframework.sh --assemble \
-  --llama-tag b4321 --whisper-tag v1.7.2
-```
-
-**Current gating.** The `--real` code paths in `scripts/build-xcframework.sh`
-are stubbed: they log the plan and write placeholder zips so the release
-upload step has something to attach. The compile is deferred until
-`Package.swift` actually references a `binaryTarget()` pin — shipping
-orphan artifacts before then would just rot in Releases. When the pin
-flips on, the TODO markers in `do_slice_real` / `do_assemble_real` become
-the live command list.
-
-## VoiceProbe reference demo (`ios/DemoApp`)
-
-VoiceProbe is the "does the SDK trace a real on-device turn" demo. It
-runs a full **ASR → LLM → TTS** voice loop with EdgeProbe wrapping each
-stage. The LLM backend has four paths:
-
-| Environment                          | Backend       | Model                                      | Size    | Loader                       |
-|--------------------------------------|---------------|--------------------------------------------|---------|------------------------------|
-| Device                               | MLX-Swift     | `mlx-community/Llama-3.2-1B-Instruct-4bit` | ~700 MB | `LLMModelFactory` (HF Hub)   |
-| Simulator, default                   | Stub          | deterministic canned reply                 | 0       | in-process, no network       |
-| Simulator, `-EDGEPROBE_SIM_LLAMACPP` | llama.cpp     | `Qwen/Qwen2.5-0.5B-Instruct-GGUF` (q4_0)    | ~428 MB | `LlamaRuntime` (sibling SwiftPM pkg) + HF Hub |
-| Simulator, `-EDGEPROBE_SIM_COREML`   | CoreML        | `finnvoorhees/coreml-SmolLM2-360M-Instruct-4bit` + tokenizer from `HuggingFaceTB/SmolLM2-360M-Instruct` | ~210 MB | `MLModel` + `MLState` via `ModelHub.swift` |
-
-If both `-EDGEPROBE_SIM_LLAMACPP` and `-EDGEPROBE_SIM_COREML` are set,
-llama.cpp wins — it's the path that actually runs real inference on
-simulator.
-
-**Why the split?** MLX requires Metal-for-compute and the iOS simulator
-doesn't expose it — `MLX.GPU` abort()s inside `mlx::core::metal::Device`
-on load. So simulator cannot use the same engine as device.
-
-We originally shipped a CoreML SmolLM2 path on simulator so CI could
-baseline latency against a real small model. That path still loads fine
-but hits a sim-CPU zero-logit bug at first prediction (see "zero-logit
-failure" below). The llama.cpp path (Slice 11,
-`-EDGEPROBE_SIM_LLAMACPP`) sidesteps both CoreML and Metal entirely:
-upstream llama.cpp's prebuilt xcframework pinned by URL + SHA-256 in
-`ios/LlamaRuntime/Package.swift`, running Qwen2.5-0.5B-Instruct-q4_0
-via handwritten quantized kernels on sim CPU. It's the path to flip
-when you want real simulator inference for benchmarks or a working
-voice demo without a physical device. The default sim path remains
-the stub so UI dev and CI smoke stay network-free.
-
-**First launch downloads ~700 MB (device), ~428 MB (sim with
-`-EDGEPROBE_SIM_LLAMACPP`), or ~210 MB (sim with `-EDGEPROBE_SIM_COREML`)
-from HuggingFace Hub.** The default sim path downloads nothing. The
-progress chip ("Downloading 42%") is bound to the actual byte stream on
-the real paths; subsequent launches hit the on-device cache.
-
-### Simulator CoreML zero-logit failure
-
-Confirmed on Xcode 26 / iOS 26 simulator / `finnvoorhees/coreml-SmolLM2-360M-Instruct-4bit`
-(2026-04-17):
-
-1. **`.cpuAndGPU` / `.all` compute units fail to load** with
-   `com.apple.CoreML` error `-14` ("Failed to build the model execution
-   plan"). The simulator's GPU backend can't codegen iOS-18 stateful
-   ops (`Ios18.readState` / `Ios18.writeState` in `model.mil`).
-2. **`.cpuOnly` loads fine but produces all-zero logits.** First
-   prediction returns a `[1, 38, 49152]` fp16 tensor where every
-   element is exactly `0.0` — verified via both `dataPointer`-bound
-   `Float16` access and `NSNumber` subscript. Strong signal that the
-   simulator's CPU backend silently no-ops the
-   `constexpr_blockwise_shift_scale` dequantization for int4 weights,
-   so every matmul multiplies by zero and the downstream logits land
-   on the zero-initialized output buffer.
-3. **Not a read-side bug.** Pointer access and subscript access agree,
-   the output shape/strides/dtype are correct (`[1, seqLen, 49152]`,
-   fp16, contiguous), and the model description reports exactly one
-   output (`logits`) with two inputs (`causal_mask`, `input_ids`).
-
-`generateSimulatorCoreML` now detects all-zero logits on the first
-prediction and throws `LLMError.inferenceFailed` with a message
-pointing back here — rather than spinning out 128 × token-id-0 until
-the budget cap and handing the user an empty string.
-
-The code is left in `LLMService.swift` (also `ModelHub.swift`) so:
-
-- If Apple ships a simulator-CPU fix, flipping
-  `-EDGEPROBE_SIM_COREML` is a one-step re-test.
-- If someone wants to try a non-int4 or non-stateful CoreML LLM that
-  sidesteps both bugs, the swap points are `Repo.coremlModel` /
-  `Repo.tokenizerSource` / `mlmodelcName` in `ModelHub.swift`. If the
-  replacement uses camelCase input names (matching swift-transformers'
-  `LanguageModel` conventions), you can revert to
-  `LanguageModel.loadCompiled` and drop the custom `MLModel +
-  MLState` driver.
-
-### Simulator CoreML caveats (still true when the path is re-enabled)
-
-- **Compute policy must be `.cpuOnly`.** Non-negotiable on simulator
-  until the GPU stateful-op codegen is fixed.
-- **The mlmodelc uses snake_case input names** (`input_ids`,
-  `causal_mask`) because it was converted straight from PyTorch with
-  default `coremltools` naming. swift-transformers' `LanguageModel`
-  wrapper hard-codes camelCase (`inputIds`, `causalMask`) and
-  fatalErrors on mismatch. The opt-in path therefore drives `MLModel`
-  + `MLState` directly and only uses `Tokenizers` for chat template /
-  encode / decode.
-- **`Float16` mask values: use `-65504` (fp16 min), not `-.infinity`.**
-  Some CoreML kernels turn `-inf + finite` into NaN, poisoning the
-  downstream softmax. We don't use blocked-mask entries today (mask is
-  all-zeros — see `predictNextToken` for why) but if you reintroduce
-  upper-triangular causal masking this is the value to reach for.
-
-### Dev ergonomics
-
-Launch args exposed by the demo app, all off by default:
-
-- `-EDGEPROBE_AUTOLOAD 1` — fires `llm.load()` on `.task` entry in
-  parallel with the mic/speech permission dialogs. Needed because
-  simulator can't accept synthetic taps without Input Monitoring TCC.
-- `-EDGEPROBE_AUTOGENERATE "<prompt>"` — after autoload succeeds, runs
-  one `llm.generate(prompt)` and prints the reply + elapsed ms to
-  stdout. Use with `xcrun simctl launch --console-pty` for CI smoke
-  tests and local benchmarking.
-- `-EDGEPROBE_SIM_LLAMACPP` — simulator only. Opts into the real
-  llama.cpp LLM path (Qwen2.5-0.5B-Instruct-q4_0 GGUF, ~428 MB
-  download on first launch). Pure CPU inference via upstream
-  llama.cpp's xcframework, deterministic greedy-sampled output. This
-  is the path to use when you want real inference on simulator
-  instead of the stub.
-- `-EDGEPROBE_SIM_COREML` — simulator only. Opts into the real CoreML
-  LLM path instead of the default stub. Currently surfaces the
-  zero-logit failure as a thrown error on the first generate; useful
-  for verifying Apple-side fixes or swapping in a different model. If
-  you just want a working real-LLM sim path today, prefer
-  `-EDGEPROBE_SIM_LLAMACPP` above.
+- **基准测试工具** —— `harness/` 是一个独立 SwiftPM 包，以 dry-run 模式把 prompt 跑过 SDK。它既是每月基准文章的 source-of-truth，也兼作 SDK 集成烟雾测试。CLI 用法见 `harness/` 目录。
+- **XCFramework 构建** —— `.github/workflows/xcframework.yml` 跟随 llama.cpp / whisper.cpp 上游 tag 扇出 `{ios, ios-simulator, macos} × {arm64, x86_64}` 构建矩阵。本地入口脚本：`scripts/build-xcframework.sh`。
