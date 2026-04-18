@@ -21,7 +21,25 @@ import type { TraceSummary } from "../src/types.ts"
  */
 
 const SHARE_SECRET = "smoke-secret-".padEnd(48, "x")
-const INGEST_KEY = "epk_pub_smoke_000000000000000000"
+
+/**
+ * Mint a fresh pub ingest key on the in-memory apiKeyStore. We can't
+ * hard-code a token the way we do for dashboard keys (`TEST_DASHBOARD_KEY_ACME`)
+ * because Slice 5's `/ingest` verifies the token via `apiKeyStore.verify`,
+ * which argon2-hashes and looks up by id — only minted or bootstrapped
+ * tokens pass. This mirrors `pubKeyFor` in
+ * `backend/test/ingestHardening.test.ts`.
+ */
+async function mintIngestKey(
+  deps: ReturnType<typeof makeMemoryDeps>,
+  orgId = "org_acme",
+): Promise<string> {
+  const { rawToken } = await deps.apiKeyStore.mint(orgId, "pub", "smoke")
+  return rawToken
+}
+
+/** Placeholder used by tests that never hit the real backend (dry-run, sabotage). */
+const DUMMY_INGEST_KEY = "epk_pub_unused_000000000000000000"
 
 function honoFetch(app: ReturnType<typeof createApp>): FetchImpl {
   // Route `fetch(url, init)` straight into the Hono app. The URL host
@@ -56,10 +74,12 @@ async function writeTempJson(body: unknown): Promise<string> {
 
 describe("Action smoke — in-process backend", () => {
   test("first-run: ingests, mints share URL, embeds it in the comment, exit 0", async () => {
-    const app = createApp(makeMemoryDeps(SHARE_SECRET))
+    const deps = makeMemoryDeps(SHARE_SECRET)
+    const app = createApp(deps)
+    const ingestKey = await mintIngestKey(deps)
     const client = new ActionClient({
       baseUrl: "http://test.invalid",
-      ingestKey: INGEST_KEY,
+      ingestKey,
       dashboardKey: TEST_DASHBOARD_KEY_ACME,
       fetchImpl: honoFetch(app),
     })
@@ -71,7 +91,7 @@ describe("Action smoke — in-process backend", () => {
       threshold: 0.15,
       failOnRegression: true,
       backendUrl: "http://test.invalid",
-      ingestKey: INGEST_KEY,
+      ingestKey,
       dashboardKey: TEST_DASHBOARD_KEY_ACME,
       orgId: "org_acme",
       projectId: "proj_demo",
@@ -95,10 +115,12 @@ describe("Action smoke — in-process backend", () => {
   })
 
   test("regression: shareUrl still minted, exit 1 because delta exceeds threshold", async () => {
-    const app = createApp(makeMemoryDeps(SHARE_SECRET))
+    const deps = makeMemoryDeps(SHARE_SECRET)
+    const app = createApp(deps)
+    const ingestKey = await mintIngestKey(deps)
     const client = new ActionClient({
       baseUrl: "http://test.invalid",
-      ingestKey: INGEST_KEY,
+      ingestKey,
       dashboardKey: TEST_DASHBOARD_KEY_ACME,
       fetchImpl: honoFetch(app),
     })
@@ -115,7 +137,7 @@ describe("Action smoke — in-process backend", () => {
       threshold: 0.15,
       failOnRegression: true,
       backendUrl: "http://test.invalid",
-      ingestKey: INGEST_KEY,
+      ingestKey,
       dashboardKey: TEST_DASHBOARD_KEY_ACME,
       orgId: "org_acme",
       projectId: "proj_demo",
@@ -136,10 +158,12 @@ describe("Action smoke — in-process backend", () => {
   })
 
   test("fail-on-regression=false: regression detected but exit still 0", async () => {
-    const app = createApp(makeMemoryDeps(SHARE_SECRET))
+    const deps = makeMemoryDeps(SHARE_SECRET)
+    const app = createApp(deps)
+    const ingestKey = await mintIngestKey(deps)
     const client = new ActionClient({
       baseUrl: "http://test.invalid",
-      ingestKey: INGEST_KEY,
+      ingestKey,
       dashboardKey: TEST_DASHBOARD_KEY_ACME,
       fetchImpl: honoFetch(app),
     })
@@ -153,7 +177,7 @@ describe("Action smoke — in-process backend", () => {
       threshold: 0.15,
       failOnRegression: false,
       backendUrl: "http://test.invalid",
-      ingestKey: INGEST_KEY,
+      ingestKey,
       dashboardKey: TEST_DASHBOARD_KEY_ACME,
       orgId: "org_acme",
       projectId: "proj_demo",
@@ -183,7 +207,7 @@ describe("Action smoke — in-process backend", () => {
       threshold: 0.15,
       failOnRegression: true,
       backendUrl: "http://test.invalid",
-      ingestKey: INGEST_KEY,
+      ingestKey: DUMMY_INGEST_KEY,
       dashboardKey: TEST_DASHBOARD_KEY_ACME,
       orgId: "org_acme",
       projectId: "proj_demo",
@@ -215,7 +239,7 @@ describe("Action smoke — in-process backend", () => {
       threshold: 0.15,
       failOnRegression: true,
       backendUrl: "http://test.invalid",
-      ingestKey: INGEST_KEY,
+      ingestKey: DUMMY_INGEST_KEY,
       dashboardKey: TEST_DASHBOARD_KEY_ACME,
       orgId: "org_acme",
       projectId: "proj_demo",
