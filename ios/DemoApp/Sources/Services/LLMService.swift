@@ -33,9 +33,16 @@ import MLXLMCommon
 // `MLModel` + `MLState`.
 import CoreML
 import Tokenizers  // Tokenizer, AutoTokenizer
+
+// llama.cpp simulator LLM path (Slice 11), opt-in via
+// `-EDGEPROBE_SIM_LLAMACPP`. Pure Swift wrapper around upstream
+// llama.cpp's xcframework — see ios/LlamaRuntime. CPU-only on sim
+// (forces n_gpu_layers = 0 internally), so no Metal and no
+// zero-logit CoreML bug. Works on iOS 16.4+ unlike the CoreML path.
+import LlamaRuntime
 #endif
 
-/// On-device LLM inference. Two real backends + one simulator stub.
+/// On-device LLM inference. One real device backend + three simulator paths.
 ///
 ///   • **Device** (`targetEnvironment(simulator) == false`):
 ///     MLX-Swift, model = `Llama-3.2-1B-Instruct-4bit` from HuggingFace.
@@ -47,7 +54,14 @@ import Tokenizers  // Tokenizer, AutoTokenizer
 ///     looks plausible. No network, no weights. Used by UI dev, CI smoke
 ///     tests, and anywhere a real LLM isn't strictly needed.
 ///
-///   • **Simulator, opt-in** (`-EDGEPROBE_SIM_COREML` launch arg):
+///   • **Simulator, opt-in: llama.cpp** (`-EDGEPROBE_SIM_LLAMACPP`,
+///     Slice 11): real on-device LLM via upstream llama.cpp's xcframework.
+///     Model = `Qwen/Qwen2.5-0.5B-Instruct-GGUF` → the q4_0 quantization
+///     (~428 MB). CPU-only on sim (the wrapper forces `n_gpu_layers = 0`),
+///     so no Metal dependency and no CoreML zero-logit bug. This is the
+///     path that actually runs real inference for simulator benchmarks.
+///
+///   • **Simulator, opt-in: CoreML** (`-EDGEPROBE_SIM_COREML`):
 ///     CoreML path against `finnvoorhees/coreml-SmolLM2-360M-Instruct-4bit`
 ///     (tokenizer from `HuggingFaceTB/SmolLM2-360M-Instruct`). ~210 MB
 ///     download. Compiles and runs but currently **produces all-zero
@@ -56,6 +70,9 @@ import Tokenizers  // Tokenizer, AutoTokenizer
 ///     simulator/CoreML fixes or model swaps can re-enable it with one
 ///     launch arg rather than a revert.
 ///
+/// Flag precedence: `-EDGEPROBE_SIM_LLAMACPP` beats
+/// `-EDGEPROBE_SIM_COREML` if both are set. Neither flag → stub.
+///
 /// Why the split:
 ///   MLX requires Metal-for-compute, which iOS simulators don't expose —
 ///   the process abort()s inside `mlx::core::metal::Device::Device` the
@@ -63,12 +80,15 @@ import Tokenizers  // Tokenizer, AutoTokenizer
 ///   device even if we wanted to.
 ///
 ///   We originally shipped CoreML SmolLM2 on simulator to give CI a real
-///   small model for latency benchmarks (not a stubbed sleep). That's
-///   blocked by the sim-CPU-zero-logits bug, so for now the sim path is a
-///   stub and benchmarks are device-only. When/if the CoreML issue is
-///   resolved, `-EDGEPROBE_SIM_COREML` is the single gate to flip.
+///   small model for latency benchmarks. That's blocked by the
+///   sim-CPU-zero-logits bug. llama.cpp sidesteps both problems because
+///   it's CPU-only by design (no Metal required) and uses its own
+///   handwritten quantized kernels (not CoreML's int4 stateful ops, which
+///   is what triggered the zero-logit bug). So llama.cpp is the real
+///   answer for "give me actual inference on simulator", and the CoreML
+///   branch stays as a cold standby for when upstream fixes land.
 ///
-/// The public API is shared between all three paths: `load()` then
+/// The public API is shared between all four paths: `load()` then
 /// `generate(_:)`. Callers in VoiceTurnController don't care which
 /// backend is live.
 @MainActor
@@ -121,6 +141,17 @@ final class LLMService: ObservableObject {
     /// it did before the default changed.
     private nonisolated let simCoreMLEnabled: Bool =
         ProcessInfo.processInfo.arguments.contains("-EDGEPROBE_SIM_COREML")
+
+    /// True only when `-EDGEPROBE_SIM_LLAMACPP` is on the launch-arg list.
+    /// Same capture-once-at-init discipline as `simCoreMLEnabled`.
+    ///
+    /// This flag wins over `simCoreMLEnabled` if both are set: llama.cpp
+    /// is the path we recommend when someone actually wants real
+    /// inference on simulator, so ordering it first in the dispatcher
+    /// keeps the mental model simple ("llamacpp if I flipped it, else
+    /// the older flag if I flipped that, else stub").
+    private nonisolated let simLlamaCppEnabled: Bool =
+        ProcessInfo.processInfo.arguments.contains("-EDGEPROBE_SIM_LLAMACPP")
     #endif
 
     // MARK: - Device-only state
@@ -164,6 +195,33 @@ final class LLMService: ObservableObject {
     /// `coremlModel` for readability — both get written in load(), read
     /// in generate(); same lifecycle, same access rules.
     private nonisolated(unsafe) var coremlTokenizer: (any Tokenizer)?
+
+    /// The loaded GGUF weights + tokenizer (embedded in the GGUF file).
+    /// Held for the session's lifetime so repeat `generate()` calls don't
+    /// pay the 400 MB mmap + vocab decode cost every time.
+    ///
+    /// `nonisolated(unsafe)` for the same reason `coremlModel` is: the
+    /// underlying C pointer inside `LlamaModel` is not Sendable, and
+    /// @MainActor-isolated storage would force each nonisolated call
+    /// site to "send" it across the actor boundary. Safety contract is
+    /// identical — `load()` writes once on MainActor before the
+    /// `isLoaded` gate flips, `generate()` reads after.
+    private nonisolated(unsafe) var llamaCppModel: LlamaModel?
+
+    /// The context + sampler chain. One-per-conversation, but for
+    /// VoiceProbe every turn is independent (no cross-turn memory) so
+    /// we reuse a single session and rely on llama.cpp's context
+    /// rolling-window to handle arbitrary turn counts within the 2048
+    /// context budget.
+    ///
+    /// If you ever want multi-turn continuity (a voice chat with
+    /// memory), either stop recreating the session OR seed each turn
+    /// with the prior rendered dialogue. Single-session reuse is the
+    /// cheaper option — session init is ~60 ms on sim CPU vs model
+    /// load's seconds.
+    ///
+    /// `nonisolated(unsafe)` rationale same as `llamaCppModel`.
+    private nonisolated(unsafe) var llamaCppSession: LlamaSession?
     #endif
 
     /// Fetch + load the model. Idempotent: subsequent calls are no-ops.
@@ -175,7 +233,17 @@ final class LLMService: ObservableObject {
         llmLog.info("load() starting")
 
         #if targetEnvironment(simulator)
-        if simCoreMLEnabled {
+        if simLlamaCppEnabled {
+            // Opt-in path (Slice 11). Real inference via llama.cpp on
+            // sim CPU. Downloads ~428 MB of GGUF the first time.
+            do {
+                try await loadSimulatorLlamaCpp()
+                llmLog.info("load() simulator llama.cpp path succeeded (opt-in)")
+            } catch {
+                llmLog.error("load() simulator llama.cpp path failed: \(error.localizedDescription, privacy: .public)")
+                throw error
+            }
+        } else if simCoreMLEnabled {
             // Opt-in path (not default). Fully functional download +
             // MLModel load; inference outputs zeros — see class doc.
             do {
@@ -294,6 +362,67 @@ final class LLMService: ObservableObject {
     }
     #endif
 
+    // MARK: - Simulator path (llama.cpp)
+
+    #if targetEnvironment(simulator)
+    /// Download the GGUF if needed, then load it into a `LlamaModel` +
+    /// `LlamaSession`. Idempotent via the `isLoaded` gate in the caller.
+    ///
+    /// Two phases:
+    ///   1. `ModelHub.ensureLlamaCppGGUF` — HubApi download to the
+    ///      standard local cache (~428 MB first time).
+    ///   2. Off-MainActor load: `LlamaModel(path:)` mmaps the file and
+    ///      parses vocab; `LlamaSession(model:)` allocates the context
+    ///      buffers. Both are CPU-bound and must not block MainActor.
+    ///
+    /// We assign into `llamaCppModel` / `llamaCppSession` back on
+    /// MainActor after the detached load finishes. That's why the
+    /// detach returns a pair via a local @unchecked-Sendable box —
+    /// `LlamaModel` / `LlamaSession` aren't `Sendable` and the compiler
+    /// won't let us return them from a detached task unless we
+    /// explicitly opt out of the check. Safety: the instances exist
+    /// only inside the detach closure until this return; the box is
+    /// never retained across additional hops.
+    ///
+    /// The `modelName` assignment happens last so the dashboard filter
+    /// reflects the actual backend. It's also what `ContentView`'s
+    /// `loadProgressLabel` keys off to pick the right copy.
+    private func loadSimulatorLlamaCpp() async throws {
+        // Download phase — MainActor-safe; HubApi callbacks bounce.
+        let ggufURL = try await ModelHub.ensureLlamaCppGGUF { [weak self] frac in
+            Task { @MainActor in self?.loadProgress = frac }
+        }
+        let ggufPath = ggufURL.path
+
+        // Local box so the detached task can hand back two non-Sendable
+        // values in one atomic return. Swift 6 requires `@unchecked
+        // Sendable` for a struct carrying non-Sendable fields; the
+        // "trust me" is discharged by the box's ephemeral lifetime —
+        // it's created inside the detach, returned by `.value`, and
+        // immediately destructured on MainActor. No shared mutation.
+        struct LoadedPair: @unchecked Sendable {
+            let model: LlamaModel
+            let session: LlamaSession
+        }
+
+        let pair = try await Task.detached(priority: .userInitiated) {
+            // llama.cpp's load path is synchronous and CPU-heavy — keep
+            // it off MainActor so the UI can keep animating the
+            // "Loading..." chip while we decode vocab tables.
+            let model = try LlamaModel(path: ggufPath)
+            let session = try LlamaSession(model: model)
+            return LoadedPair(model: model, session: session)
+        }.value
+
+        // Back on MainActor — publish state + bump progress to exactly 1.0.
+        self.llamaCppModel = pair.model
+        self.llamaCppSession = pair.session
+        self.modelName = "qwen2.5-0.5b-instruct-q4-llamacpp"
+        self.isLoaded = true
+        self.loadProgress = 1.0
+    }
+    #endif
+
     /// Generate a reply to `prompt`. Greedy decoding, 128-token cap —
     /// keeps replies voice-friendly and, more importantly, makes
     /// benchmark latency deterministic (temperature=0, doSample=false).
@@ -304,6 +433,9 @@ final class LLMService: ObservableObject {
     /// better than it is.
     func generate(_ prompt: String) async throws -> String {
         #if targetEnvironment(simulator)
+        if simLlamaCppEnabled {
+            return try await generateSimulatorLlamaCpp(prompt)
+        }
         if simCoreMLEnabled {
             return try await generateSimulatorCoreML(prompt)
         }
@@ -618,6 +750,60 @@ final class LLMService: ObservableObject {
             )
         }
         return bestTok
+    }
+    #endif
+
+    // MARK: - Simulator generation (llama.cpp)
+
+    #if targetEnvironment(simulator)
+    /// System prompt intentionally matches the MLX device path and the
+    /// CoreML sim path so all three backends produce comparable outputs
+    /// for the same user prompt. Keeps benchmark diffs apples-to-apples.
+    private nonisolated static let llamaCppSystemPrompt =
+        "You are a concise voice assistant. Reply in one or two short sentences."
+
+    /// Max new tokens per turn. Matches the other two paths; 128 is enough
+    /// for two short sentences and caps worst-case latency at ~2s on sim
+    /// CPU for Qwen2.5-0.5B-q4.
+    private nonisolated static let llamaCppMaxTokens = 128
+
+    /// Run one voice turn through llama.cpp. Greedy sampling (configured
+    /// in `LlamaSession.init`) so output is deterministic — same prompt
+    /// → same reply → same token timing, good for regression asserts.
+    ///
+    /// `nonisolated` + `Task.detached` for the same dual reason the
+    /// CoreML path is `nonisolated`:
+    ///   1. `LlamaSession` is not Sendable (C pointers under the hood;
+    ///      concurrent use corrupts the KV cache).
+    ///   2. llama.cpp's `llama_decode` is a synchronous blocking call —
+    ///      running it on MainActor would freeze the UI for the full
+    ///      generation window (~1–2s on sim CPU for 128 tokens).
+    ///
+    /// We hand the non-Sendable `LlamaSession` into the detached task
+    /// via an `@unchecked Sendable` box — same pattern as the load
+    /// path. Safety rests on the @MainActor class + UI load-gate
+    /// guaranteeing serial generate() calls.
+    private nonisolated func generateSimulatorLlamaCpp(_ prompt: String) async throws -> String {
+        guard let session = llamaCppSession else {
+            throw LLMError.modelNotLoaded
+        }
+
+        struct SessionBox: @unchecked Sendable {
+            let session: LlamaSession
+        }
+        let box = SessionBox(session: session)
+
+        do {
+            return try await Task.detached(priority: .userInitiated) {
+                try box.session.generate(
+                    systemPrompt: Self.llamaCppSystemPrompt,
+                    userPrompt: prompt,
+                    maxNewTokens: Self.llamaCppMaxTokens
+                )
+            }.value
+        } catch {
+            throw LLMError.inferenceFailed(error.localizedDescription)
+        }
     }
     #endif
 }

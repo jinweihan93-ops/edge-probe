@@ -153,31 +153,40 @@ the live command list.
 
 VoiceProbe is the "does the SDK trace a real on-device turn" demo. It
 runs a full **ASR → LLM → TTS** voice loop with EdgeProbe wrapping each
-stage. The LLM backend has three paths:
+stage. The LLM backend has four paths:
 
 | Environment                          | Backend       | Model                                      | Size    | Loader                       |
 |--------------------------------------|---------------|--------------------------------------------|---------|------------------------------|
 | Device                               | MLX-Swift     | `mlx-community/Llama-3.2-1B-Instruct-4bit` | ~700 MB | `LLMModelFactory` (HF Hub)   |
 | Simulator, default                   | Stub          | deterministic canned reply                 | 0       | in-process, no network       |
+| Simulator, `-EDGEPROBE_SIM_LLAMACPP` | llama.cpp     | `Qwen/Qwen2.5-0.5B-Instruct-GGUF` (q4_0)    | ~428 MB | `LlamaRuntime` (sibling SwiftPM pkg) + HF Hub |
 | Simulator, `-EDGEPROBE_SIM_COREML`   | CoreML        | `finnvoorhees/coreml-SmolLM2-360M-Instruct-4bit` + tokenizer from `HuggingFaceTB/SmolLM2-360M-Instruct` | ~210 MB | `MLModel` + `MLState` via `ModelHub.swift` |
+
+If both `-EDGEPROBE_SIM_LLAMACPP` and `-EDGEPROBE_SIM_COREML` are set,
+llama.cpp wins — it's the path that actually runs real inference on
+simulator.
 
 **Why the split?** MLX requires Metal-for-compute and the iOS simulator
 doesn't expose it — `MLX.GPU` abort()s inside `mlx::core::metal::Device`
 on load. So simulator cannot use the same engine as device.
 
 We originally shipped a CoreML SmolLM2 path on simulator so CI could
-baseline latency against a real small model. It now does not run
-because of a simulator/CoreML bug (see "zero-logit failure" below), so
-the simulator default is a stub that still exercises the SDK's trace
-pipeline with plausible (~600ms) synthetic LLM latency. The real CoreML
-code is still in the tree and gated behind `-EDGEPROBE_SIM_COREML` so
-future reinvestigation is a launch-arg away, not a revert.
+baseline latency against a real small model. That path still loads fine
+but hits a sim-CPU zero-logit bug at first prediction (see "zero-logit
+failure" below). The llama.cpp path (Slice 11,
+`-EDGEPROBE_SIM_LLAMACPP`) sidesteps both CoreML and Metal entirely:
+upstream llama.cpp's prebuilt xcframework pinned by URL + SHA-256 in
+`ios/LlamaRuntime/Package.swift`, running Qwen2.5-0.5B-Instruct-q4_0
+via handwritten quantized kernels on sim CPU. It's the path to flip
+when you want real simulator inference for benchmarks or a working
+voice demo without a physical device. The default sim path remains
+the stub so UI dev and CI smoke stay network-free.
 
-**First launch downloads ~700 MB (device) or ~210 MB (sim with
-`-EDGEPROBE_SIM_COREML`) from HuggingFace Hub.** The default sim path
-downloads nothing. The progress chip ("Downloading 42%") is bound to
-the actual byte stream on the real paths; subsequent launches hit the
-on-device cache.
+**First launch downloads ~700 MB (device), ~428 MB (sim with
+`-EDGEPROBE_SIM_LLAMACPP`), or ~210 MB (sim with `-EDGEPROBE_SIM_COREML`)
+from HuggingFace Hub.** The default sim path downloads nothing. The
+progress chip ("Downloading 42%") is bound to the actual byte stream on
+the real paths; subsequent launches hit the on-device cache.
 
 ### Simulator CoreML zero-logit failure
 
@@ -246,7 +255,15 @@ Launch args exposed by the demo app, all off by default:
   one `llm.generate(prompt)` and prints the reply + elapsed ms to
   stdout. Use with `xcrun simctl launch --console-pty` for CI smoke
   tests and local benchmarking.
+- `-EDGEPROBE_SIM_LLAMACPP` — simulator only. Opts into the real
+  llama.cpp LLM path (Qwen2.5-0.5B-Instruct-q4_0 GGUF, ~428 MB
+  download on first launch). Pure CPU inference via upstream
+  llama.cpp's xcframework, deterministic greedy-sampled output. This
+  is the path to use when you want real inference on simulator
+  instead of the stub.
 - `-EDGEPROBE_SIM_COREML` — simulator only. Opts into the real CoreML
   LLM path instead of the default stub. Currently surfaces the
   zero-logit failure as a thrown error on the first generate; useful
-  for verifying Apple-side fixes or swapping in a different model.
+  for verifying Apple-side fixes or swapping in a different model. If
+  you just want a working real-LLM sim path today, prefer
+  `-EDGEPROBE_SIM_LLAMACPP` above.

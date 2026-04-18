@@ -153,13 +153,28 @@ struct ContentView: View {
     }
 
     /// Chip label during load. Honest per-path wording so the user can't
-    /// mistake the 600ms sim-stub animation for a real download.
+    /// mistake the 600ms sim-stub animation for a real download, and so
+    /// the llama.cpp sim path makes clear that a real ~428 MB model is
+    /// coming down rather than a CoreML snapshot.
+    ///
+    /// Strings must match `LLMService.modelName` assignments exactly:
+    ///   • `stub-sim-llm`                          → sim stub
+    ///   • `qwen2.5-0.5b-instruct-q4-llamacpp`     → sim llama.cpp (Slice 11)
+    ///   • `llama-3.2-1b-instruct-4bit-mlx`        → device MLX
+    ///   • (CoreML path doesn't rename — keeps the MLX default on sim)
     private var loadProgressLabel: String {
         let pct = Int(llm.loadProgress * 100)
-        if llm.modelName == "stub-sim-llm" {
+        switch llm.modelName {
+        case "stub-sim-llm":
             return "Warming stub \(pct)%"
+        case "qwen2.5-0.5b-instruct-q4-llamacpp":
+            // Qwen q4_0 GGUF is ~428 MB on first launch, cached after.
+            // Loading is mostly network until ~95% then a short mmap
+            // + vocab decode; fine to keep one shared label for both.
+            return "Downloading Qwen GGUF \(pct)%"
+        default:
+            return "Downloading \(pct)%"
         }
-        return "Downloading \(pct)%"
     }
 
     private var turnOutput: some View {

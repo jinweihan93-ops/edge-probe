@@ -19,6 +19,15 @@ options:
 packages:
   EdgeProbe:
     path: ..
+  # LlamaRuntime: a thin Swift wrapper around the upstream llama.cpp
+  # XCFramework. Lives in a sibling SwiftPM package (`../LlamaRuntime`)
+  # rather than being folded into EdgeProbe so backend/CI consumers of
+  # the SDK don't pay the 169 MB binaryTarget download. VoiceProbe uses
+  # it only on simulator under the `-EDGEPROBE_SIM_LLAMACPP` launch
+  # arg — a real on-device GGUF-backed LLM path that bypasses the
+  # CoreML zero-logit bug described in the VoiceProbe README.
+  LlamaRuntime:
+    path: ../LlamaRuntime
   mlx-swift-examples:
     url: https://github.com/ml-explore/mlx-swift-examples
     # Pin to a recent tag — mlx-swift-examples ships frequently and their API
@@ -36,6 +45,10 @@ packages:
     # camelCase CoreML input names and doesn't match the finnvoorhees
     # SmolLM2 export (snake_case `input_ids` / `causal_mask`), so we bypass
     # it. iOS 18 runtime guard is applied at the call sites.
+    #
+    # The `-EDGEPROBE_SIM_LLAMACPP` path (Slice 11) also uses `HubApi`
+    # from this package to pull a GGUF file from Qwen's HF repo — we
+    # reuse swift-transformers rather than hand-rolling a downloader.
     from: "1.0.0"
 
 targets:
@@ -106,3 +119,10 @@ targets:
         product: Transformers
       - package: swift-transformers
         product: Hub
+      # llama.cpp simulator LLM (Slice 11). Only referenced from code
+      # behind `#if targetEnvironment(simulator)` and further gated by
+      # the `-EDGEPROBE_SIM_LLAMACPP` launch arg. Device builds link it
+      # but never execute it; the xcframework dead-strips easily since
+      # no device-path code touches any LlamaRuntime symbol.
+      - package: LlamaRuntime
+        product: LlamaRuntime

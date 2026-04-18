@@ -19,6 +19,7 @@ Follow-up work creates a new slice, not a rename.
 - [x] **Slice 8** — XCFramework build workflow on upstream tags
 - [x] **Slice 9** — Benchmark harness (Y1 OSS tool) — minimal first cut
 - [x] **Slice 10** — VoiceProbe cleanup tail from Slice 0
+- [x] **Slice 11** — Real on-device LLM on simulator via llama.cpp
 
 ## Slice contracts
 
@@ -212,3 +213,39 @@ returns stub text" is stable.
 **Done:** VoiceProbe `README.md` matches what the code actually does, no
 new TODOs introduced, simulator smoke via `-EDGEPROBE_AUTOLOAD 1
 -EDGEPROBE_AUTOGENERATE "hello"` produces a stable textual output.
+
+### Slice 11 — Real on-device LLM on simulator via llama.cpp
+
+**Why:** Slice 0's CoreML sim path is blocked on an Apple-side zero-logit
+bug that we can't fix. The simulator has had no working real-LLM path
+since — benchmarks, recorded demos, and any "does the voice turn actually
+run inference" smoke needed a physical device. llama.cpp's prebuilt
+xcframework runs CPU-only (no Metal, no CoreML) and is exactly the right
+size for a 0.5B model on sim CPU, so a third sim path that bypasses both
+failure modes unblocks everything without waiting on Apple.
+
+**Scope:**
+- New sibling SwiftPM package `ios/LlamaRuntime/` that pins upstream
+  llama.cpp's prebuilt xcframework by URL + SHA-256 (tag `b8833`).
+  Thin Swift wrapper (`LlamaModel` + `LlamaSession`) deliberately kept
+  small — no streaming, no Config knobs, greedy sampling only. Lives
+  outside `ios/` SDK so backend/CI consumers don't pay the 169 MB
+  binaryTarget download cost.
+- VoiceProbe: third simulator LLM path opt-in via
+  `-EDGEPROBE_SIM_LLAMACPP`. Wins over `-EDGEPROBE_SIM_COREML` if both
+  set. Downloads `Qwen/Qwen2.5-0.5B-Instruct-GGUF` (q4_0, ~428 MB) on
+  first launch via `HubApi.snapshot`; caches afterwards. Forces
+  `n_gpu_layers = 0` so no Metal dep.
+- `ModelHub.swift`: new `ensureLlamaCppGGUF(progress:)` helper,
+  ungated (llama.cpp works on iOS 16.4+; `ensureAvailable` stays
+  `@available(iOS 18.0, *)` for the CoreML path).
+- `ContentView.loadProgressLabel` picks "Downloading Qwen GGUF X%"
+  when the llama.cpp path is live.
+- Docs: four-path table in both `README.md` and `ios/DemoApp/README.md`,
+  launch-arg section updated.
+
+**Done:** VoiceProbe built for simulator links `llama.framework` into
+the `.app`, `swift test` in `ios/LlamaRuntime` passes 3/3 (error
+descriptions, missing-file throw, raw C-symbol import), and flipping
+`-EDGEPROBE_SIM_LLAMACPP` on the scheme produces model-generated tokens
+(not stub text) after the first-launch download.
