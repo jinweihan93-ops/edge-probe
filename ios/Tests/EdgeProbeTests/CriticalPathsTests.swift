@@ -103,7 +103,7 @@ final class CriticalPathsTests: XCTestCase {
         XCTAssertEqual(
             EdgeProbe.startCallCount,
             iterations,
-            "Critical Path #6 regressed — call count should record every call, even though init ran once",
+            "Critical Path #6 regressed — call count should record every call, even though init ran once"
         )
         // The spy exporter path: replacing the exporter via the test hook
         // mid-flight must still leave the singleton initialized (isStarted
