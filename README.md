@@ -35,15 +35,15 @@ That's the whole pitch. The SDK captures the span, exports it to the backend, an
 
 ### See it live on a PR
 
-EdgeProbe also ships as a **GitHub Action** for benchmark regressions. Three permanently-open demo PRs under [`examples/whisper-upstream-mock/`](examples/whisper-upstream-mock/) show the full rendered comment:
+EdgeProbe also ships as a **GitHub Action** for benchmark regressions. Three permanently-open demo PRs live in a separate repo — [**`jinweihan93-ops/edgeprobe-whisper-demo`**](https://github.com/jinweihan93-ops/edgeprobe-whisper-demo) — simulating a whisper.cpp maintainer using EdgeProbe in CI:
 
 | Demo PR | What changed | What the EdgeProbe comment looks like |
 |---------|--------------|---------------------------------------|
-| [#5 `demo/first-run`](https://github.com/jinweihan93-ops/edge-probe/pull/5) | new project, no baseline yet | First-trace card, share URL, no regression math |
-| [#3 `demo/regression`](https://github.com/jinweihan93-ops/edge-probe/pull/3) | `beam_size: 1 → 5` | **Red** — decode +4×, headline +114%, share URL |
-| [#4 `demo/green`](https://github.com/jinweihan93-ops/edge-probe/pull/4) | `n_threads: 4 → 8` | **Green ✓** — encoder speedup, headline −18% |
+| [first-run](https://github.com/jinweihan93-ops/edgeprobe-whisper-demo/pull/3) | new project, no baseline yet | First-trace card, share URL, no regression math |
+| [regression](https://github.com/jinweihan93-ops/edgeprobe-whisper-demo/pull/1) | `beam_size: 1 → 5` | **Red** — decode +4×, headline +114%, share URL |
+| [green](https://github.com/jinweihan93-ops/edgeprobe-whisper-demo/pull/2) | `n_threads: 4 → 8` | **Green ✓** — encoder speedup, headline −18% |
 
-The synth is deterministic, so every re-run of the same PR produces byte-identical numbers. See [`examples/whisper-upstream-mock/README.md`](examples/whisper-upstream-mock/README.md) for the math behind the numbers.
+Those PRs reference the Action at the pinned tag [`action-v0.1.0`](https://github.com/jinweihan93-ops/edge-probe/tree/action-v0.1.0/action) — exactly the consumer shape a real downstream repo would use. The synth is deterministic, so every re-run of the same PR produces byte-identical numbers. See [the demo repo's README](https://github.com/jinweihan93-ops/edgeprobe-whisper-demo#readme) for the math behind the numbers.
 
 ### Status
 
@@ -141,15 +141,15 @@ try EdgeProbe.trace(.llm) {
 
 ### 在 PR 上直接看效果
 
-EdgeProbe 同时以 **GitHub Action** 形式发布，用于基准回归检测。[`examples/whisper-upstream-mock/`](examples/whisper-upstream-mock/) 目录下有三个长期开着的 demo PR，可以直接点进去看 Action 渲染的 PR 评论长什么样：
+EdgeProbe 同时以 **GitHub Action** 形式发布，用于基准回归检测。为了体现真实的「第三方消费者姿态」，demo 单独放在 [**`jinweihan93-ops/edgeprobe-whisper-demo`**](https://github.com/jinweihan93-ops/edgeprobe-whisper-demo) 仓库里，模拟一位 whisper.cpp 维护者在 CI 里用 EdgeProbe：
 
 | Demo PR | 改动 | EdgeProbe 评论效果 |
 |---------|------|--------------------|
-| [#5 `demo/first-run`](https://github.com/jinweihan93-ops/edge-probe/pull/5) | 新项目，尚无 baseline | 首次 trace 卡片 + 分享链接，不做回归比较 |
-| [#3 `demo/regression`](https://github.com/jinweihan93-ops/edge-probe/pull/3) | `beam_size: 1 → 5` | **红** —— decode +4×，headline +114%，含分享链接 |
-| [#4 `demo/green`](https://github.com/jinweihan93-ops/edge-probe/pull/4) | `n_threads: 4 → 8` | **绿 ✓** —— encoder 加速，headline −18% |
+| [first-run](https://github.com/jinweihan93-ops/edgeprobe-whisper-demo/pull/3) | 新项目，尚无 baseline | 首次 trace 卡片 + 分享链接，不做回归比较 |
+| [regression](https://github.com/jinweihan93-ops/edgeprobe-whisper-demo/pull/1) | `beam_size: 1 → 5` | **红** —— decode +4×，headline +114%，含分享链接 |
+| [green](https://github.com/jinweihan93-ops/edgeprobe-whisper-demo/pull/2) | `n_threads: 4 → 8` | **绿 ✓** —— encoder 加速，headline −18% |
 
-合成函数是确定性的 —— 同一个 PR 无论重跑多少次，数字都字节级一致。演算逻辑见 [`examples/whisper-upstream-mock/README.md`](examples/whisper-upstream-mock/README.md)。
+这些 PR 引用的是 Action 的固定 tag [`action-v0.1.0`](https://github.com/jinweihan93-ops/edge-probe/tree/action-v0.1.0/action) —— 正是一个真实下游项目会用的姿态。合成函数是确定性的，同一个 PR 无论重跑多少次，数字都字节级一致。演算逻辑见 [demo 仓库的 README](https://github.com/jinweihan93-ops/edgeprobe-whisper-demo#readme)。
 
 ### 当前状态
 
