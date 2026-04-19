@@ -381,6 +381,47 @@ describe("summaryToIngestPayload + parseArgs — wire contract", () => {
     }
   })
 
+  test("multi-turn spans are sequential: turn N startedAt = turn N-1 endedAt", () => {
+    // Regression: before the fix, every turn reset cursor to `now`, so
+    // whisper_turn1 and whisper_turn2 shared startedAt, and decode_turn1
+    // vs decode_turn2 ordered by whichever whisper was slower. After the
+    // fix the stream is strictly monotonic per kind.
+    const now = new Date("2026-04-17T00:00:00Z")
+    const summary: TraceSummary = {
+      project: "p",
+      label: "l",
+      headlineMetric: "ms",
+      headlineMs: 100,
+      totalMs: 260,
+      turns: [
+        { turn: 1, stages: { whisper: 60, decode: 80 }, totalMs: 140 },
+        { turn: 2, stages: { whisper: 59, decode: 61 }, totalMs: 120 },
+      ],
+    }
+    const payload = summaryToIngestPayload(summary, {
+      orgId: "o", projectId: "p", now,
+    })
+    const byName = (name: string) =>
+      payload.spans
+        .filter((s) => s.name === name)
+        .sort((a, b) => (a.attributes as { turn: number }).turn
+          - (b.attributes as { turn: number }).turn)
+    const whispers = byName("whisper")
+    const decodes = byName("decode")
+    // Same-kind monotonicity — the property the waterfall relies on.
+    expect(Date.parse(whispers[0]!.startedAt as string))
+      .toBeLessThan(Date.parse(whispers[1]!.startedAt as string))
+    expect(Date.parse(decodes[0]!.startedAt as string))
+      .toBeLessThan(Date.parse(decodes[1]!.startedAt as string))
+    // Turn handoff: turn 2's first span starts exactly when turn 1 ended.
+    expect(whispers[1]!.startedAt).toBe(decodes[0]!.endedAt)
+    // Durations still reflect the input — we only move absolute times.
+    expect(whispers[0]!.durationMs).toBe(60)
+    expect(whispers[1]!.durationMs).toBe(59)
+    expect(decodes[0]!.durationMs).toBe(80)
+    expect(decodes[1]!.durationMs).toBe(61)
+  })
+
   test("parseArgs picks up long flags + booleans", () => {
     const parsed = parseArgs([
       "--trace", "/tmp/t.json",
