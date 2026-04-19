@@ -139,7 +139,7 @@ function renderTurnTable(input: CommentInput): string {
   // Should be derived from the union of stage keys present in the trace,
   // with a stable order hinted by the trace itself. Safe to defer until
   // the second non-voice-loop benchmark lands — see bin/synthesize.ts in
-  // jinweihan93-ops/edgeprobe-whisper-demo for the workaround pattern.
+  // jinweihan-ai/edgeprobe-whisper-demo for the workaround pattern.
   const columns = ["Turn", "whisper", "prefill", "decode", "total", "delta"]
   const currentByTurn = new Map(input.current.turns.map((t) => [t.turn, t]))
 
