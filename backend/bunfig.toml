@@ -1,0 +1,43 @@
+# backend/bunfig.toml
+#
+# Scoped to `bun test` configuration. Runtime bun (bun run src/server.ts)
+# doesn't read this for its own behavior — only the test runner does.
+#
+# Purpose: exclude production-only Postgres implementations from the
+# coverage aggregate. These files ship in production but the test
+# suite swaps them out for in-memory equivalents via dependency
+# injection (see `backend/src/server.ts` `createApp(deps)`), so
+# covering them in `bun test` would require an actual Postgres — out
+# of scope for CI (and specifically rejected in PLAN.md's P0 ingest
+# section, which calls out sync Postgres as trivial at $0 MRR and
+# explicitly deferred).
+#
+# Without this exclusion, the backend aggregate reads ~65% simply
+# because the pg*.ts files contribute ~0% coverage and drag the whole
+# average down. With these files excluded, the aggregate reflects what
+# the in-memory-backed test suite actually exercises — a meaningful
+# baseline that future coverage thresholds (Slice 14 follow-up) can
+# gate against without inventing exceptions for "the files that can't
+# be tested anyway."
+#
+# Files listed here, and why:
+#   • src/db.ts               — Postgres connection factory. In-memory
+#                               tests never open a connection.
+#   • src/migrate.ts          — one-shot migration CLI. Run manually;
+#                               no unit-test harness.
+#   • src/pgApiKeyStore.ts    — real Postgres API-key store. Tests use
+#                               InMemoryApiKeyStore via `makeMemoryDeps`.
+#   • src/pgSpanStore.ts      — real Postgres span store. Tests use
+#                               InMemorySpanStore via `makeMemoryDeps`.
+#
+# If you add a new pg*.ts, append it here. If you add a test that does
+# spin up real Postgres (e.g. a conditional integration suite against a
+# local docker-compose), REMOVE the corresponding entry so the integration
+# path gets counted.
+[test]
+coveragePathIgnorePatterns = [
+  "src/db.ts",
+  "src/migrate.ts",
+  "src/pgApiKeyStore.ts",
+  "src/pgSpanStore.ts",
+]
