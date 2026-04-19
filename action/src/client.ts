@@ -73,9 +73,15 @@ export function summaryToIngestPayload(summary: TraceSummary, opts: {
   const endIso = new Date(start.getTime() + Math.max(1, totalMs)).toISOString()
   const traceId = `trace_ci_${start.getTime().toString(36)}_${randomHex(4)}`
 
+  // Turns play back-to-back: turn N starts where turn N-1 ended. Resetting
+  // the cursor per-turn makes same-kind spans across turns share startedAt
+  // (or cross — whichever turn's previous stage was slower ends up later),
+  // which scrambles the waterfall in web/ where spans are sorted by startedAt.
+  let cursor = start.getTime()
   const spans = summary.turns.flatMap((t) => {
-    const turnStart = start.getTime()
-    return buildTurnSpans(traceId, t, turnStart)
+    const turnSpans = buildTurnSpans(traceId, t, cursor)
+    cursor += sumStageDurations(t.stages)
+    return turnSpans
   })
 
   return {
@@ -127,6 +133,12 @@ function buildTurnSpans(
     })
   }
   return out
+}
+
+function sumStageDurations(stages: TraceSummary["turns"][number]["stages"]): number {
+  let s = 0
+  for (const v of Object.values(stages)) if (v !== undefined) s += v
+  return s
 }
 
 function kindOfStage(stage: string): "llm" | "asr" | "tts" | string {
