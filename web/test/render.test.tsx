@@ -202,6 +202,113 @@ describe("Private trace HTML — auth'd dashboard", () => {
   })
 })
 
+describe("Public share HTML — Action CI-ingest shape", () => {
+  // The Action sends a very different shape than the iOS SDK:
+  //   - device is tagged as `device.label` (config string), not device.model
+  //   - model lives at trace-level attributes, not on each LLM span
+  //   - multi-turn benchmarks produce duplicate span names (whisper×2, decode×2)
+  //     disambiguated only by an integer `turn` attribute
+  // If any of those cascade fallbacks regress, the demo PRs render
+  // "unknown model on unknown device" + four undifferentiated rows, which is
+  // exactly what shipped and broke in staging before this fix.
+  function actionShape(): PublicTraceResponse {
+    return {
+      trace: {
+        id: "trace_ci_001",
+        startedAt: "2026-04-15T12:00:00.000Z",
+        endedAt: "2026-04-15T12:00:01.400Z",
+        device: { label: "whisper-base · threads=4 · beam=5" },
+        attributes: { "gen_ai.request.model": "whisper-base" },
+      },
+      spans: [
+        {
+          id: "s1",
+          traceId: "trace_ci_001",
+          parentSpanId: null,
+          name: "whisper",
+          kind: "asr",
+          startedAt: "2026-04-15T12:00:00.000Z",
+          endedAt: "2026-04-15T12:00:00.300Z",
+          durationMs: 300,
+          status: "ok",
+          attributes: { turn: 1 },
+        },
+        {
+          id: "s2",
+          traceId: "trace_ci_001",
+          parentSpanId: null,
+          name: "decode",
+          kind: "llm",
+          startedAt: "2026-04-15T12:00:00.300Z",
+          endedAt: "2026-04-15T12:00:00.700Z",
+          durationMs: 400,
+          status: "ok",
+          attributes: { turn: 1 },
+        },
+        {
+          id: "s3",
+          traceId: "trace_ci_001",
+          parentSpanId: null,
+          name: "whisper",
+          kind: "asr",
+          startedAt: "2026-04-15T12:00:00.700Z",
+          endedAt: "2026-04-15T12:00:01.000Z",
+          durationMs: 300,
+          status: "ok",
+          attributes: { turn: 2 },
+        },
+        {
+          id: "s4",
+          traceId: "trace_ci_001",
+          parentSpanId: null,
+          name: "decode",
+          kind: "llm",
+          startedAt: "2026-04-15T12:00:01.000Z",
+          endedAt: "2026-04-15T12:00:01.400Z",
+          durationMs: 400,
+          status: "ok",
+          attributes: { turn: 2 },
+        },
+      ],
+    }
+  }
+
+  test("H1 renders the model name even though it only lives at trace-level", async () => {
+    const { app } = makeApp({ fetchPublic: async () => actionShape() } as Partial<BackendClient>)
+    const res = await app.request("/r/tok")
+    const html = await res.text()
+    expect(html).toContain("whisper-base")
+    // The pre-fix bug: "unknown model on unknown device" — must never appear.
+    expect(html.toLowerCase()).not.toContain("unknown model")
+    expect(html.toLowerCase()).not.toContain("unknown device")
+  })
+
+  test("H1 de-dupes when trace-level model equals device.label", async () => {
+    // CI-ingest frequently labels the device the same as the model
+    // (same config string). Render one copy, not "X on X".
+    const data = actionShape()
+    data.trace.device = { label: "whisper-base" }
+    const { app } = makeApp({ fetchPublic: async () => data } as Partial<BackendClient>)
+    const res = await app.request("/r/tok")
+    const html = await res.text()
+    expect(html).not.toContain("whisper-base on whisper-base")
+    expect(html).toContain("whisper-base")
+  })
+
+  test("waterfall rows include turn suffix so duplicate names are distinguishable", async () => {
+    const { app } = makeApp({ fetchPublic: async () => actionShape() } as Partial<BackendClient>)
+    const res = await app.request("/r/tok")
+    const html = await res.text()
+    // `·` is HTML-escaped differently by different renderers — Hono emits the
+    // literal UTF-8 character in attribute values and text nodes, so we match
+    // on the exact label substring.
+    expect(html).toContain("whisper · turn 1")
+    expect(html).toContain("whisper · turn 2")
+    expect(html).toContain("decode · turn 1")
+    expect(html).toContain("decode · turn 2")
+  })
+})
+
 describe("OG + social unfurl metadata", () => {
   test("public page declares og:title + og:description that carry no prompt text", async () => {
     const { app } = makeApp()

@@ -20,6 +20,12 @@ export interface SpanLike {
   endedAt: string
   durationMs: number
   status: "ok" | "error"
+  /**
+   * Optional — PublicSpan carries this, but not every caller of `SpanLike`
+   * (the type this interface abstracts over) does. Used for turn-number
+   * disambiguation in the waterfall and model-name fallbacks.
+   */
+  attributes?: Record<string, unknown>
 }
 
 export interface TraceHeader {
@@ -47,7 +53,6 @@ export function computeMetrics(header: TraceHeader, spans: SpanLike[]): Metrics 
   let llmMs = 0
   let asrMs = 0
   let errorSeen = false
-  let modelName: string | null = null
 
   for (const s of spans) {
     if (s.kind === "llm") llmMs += s.durationMs
@@ -55,19 +60,27 @@ export function computeMetrics(header: TraceHeader, spans: SpanLike[]): Metrics 
     if (s.status === "error") errorSeen = true
   }
 
-  // gen_ai.request.model is the OTel-ish attribute key the SDK emits.
-  // Take the first one we see on an llm span.
+  // Model name: OTel convention is `gen_ai.request.model` on each LLM span.
+  // We check span-level first (that's what the iOS SDK emits — one model per
+  // span), then fall back to trace-level attributes. The Action's CI-ingest
+  // payload puts it at trace-level because a CI benchmark is one model per
+  // trace, not per span.
+  let modelName: string | null = null
   for (const s of spans) {
     if (s.kind !== "llm") continue
-    const attrs = (s as unknown as { attributes?: Record<string, unknown> }).attributes
-    const m = attrs?.["gen_ai.request.model"]
-    if (typeof m === "string") {
-      modelName = m
-      break
-    }
+    const m = s.attributes?.["gen_ai.request.model"]
+    if (typeof m === "string" && m.length > 0) { modelName = m; break }
+  }
+  if (!modelName) {
+    const m = header.attributes["gen_ai.request.model"]
+    if (typeof m === "string" && m.length > 0) modelName = m
   }
 
-  const deviceModel = typeof header.device["model"] === "string" ? (header.device["model"] as string) : null
+  // Device label: the iOS SDK emits `device.model` + `device.name` (+ `os`),
+  // modeled on OTel's `device.model.identifier`. The Action has no real
+  // device — it tags the config string as `device.label` instead. We try the
+  // specific fields first, then fall back to `label`, so both shapes render.
+  const deviceModel = firstString(header.device, ["model", "name", "label"])
 
   return {
     totalMs,
@@ -78,6 +91,14 @@ export function computeMetrics(header: TraceHeader, spans: SpanLike[]): Metrics 
     modelName,
     status: errorSeen ? "error" : "ok",
   }
+}
+
+function firstString(o: Record<string, unknown>, keys: string[]): string | null {
+  for (const k of keys) {
+    const v = o[k]
+    if (typeof v === "string" && v.length > 0) return v
+  }
+  return null
 }
 
 function maxEndMs(spans: SpanLike[], fallback: number): number {
@@ -120,11 +141,33 @@ export function computeWaterfall(header: TraceHeader, spans: SpanLike[]): {
 
   const depths = depthByParent(spans)
 
-  const rows = spans.map<WaterfallRow>((s) => {
+  // Multi-turn disambiguation: when two spans share the same `name` AND at
+  // least one has a numeric `turn` attribute, append "· turn N" to the display
+  // name so the reader can tell them apart. The Action's CI-ingest produces
+  // this shape (two `whisper` spans, one per benchmark turn), as will the iOS
+  // SDK for multi-turn conversations. Single-span traces or one-turn SDK
+  // emissions (the 99% case) are untouched.
+  const nameCounts = new Map<string, number>()
+  for (const s of spans) nameCounts.set(s.name, (nameCounts.get(s.name) ?? 0) + 1)
+
+  // Backend returns spans in ingest order (iOS SDK emits on finish), which
+  // only coincides with start time for single-turn traces. Sort by startedAt
+  // so the name column reads top-to-bottom as time flows downward. Tiebreak
+  // on id so output is deterministic when two spans share a millisecond.
+  const ordered = [...spans].sort((a, b) => {
+    const t = Date.parse(a.startedAt) - Date.parse(b.startedAt)
+    if (t !== 0) return t
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
+  })
+
+  const rows = ordered.map<WaterfallRow>((s) => {
     const startOffset = Date.parse(s.startedAt) - originMs
+    const turn = s.attributes?.["turn"]
+    const needsTurnSuffix = (nameCounts.get(s.name) ?? 0) > 1 && typeof turn === "number"
+    const displayName = needsTurnSuffix ? `${s.name} · turn ${turn}` : s.name
     return {
       id: s.id,
-      name: s.name,
+      name: displayName,
       kind: s.kind,
       durationMs: s.durationMs,
       status: s.status,

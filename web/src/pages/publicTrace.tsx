@@ -36,10 +36,16 @@ export function PublicTracePage({
   const metrics = computeMetrics(data.trace, data.spans)
   const { rows, ticks, totalMs } = computeWaterfall(data.trace, data.spans)
 
-  const deviceLabel = metrics.deviceModel ?? "unknown device"
-  const modelLabel = metrics.modelName ?? "unknown model"
   // Verdict H1: numbers over adjectives, matches DESIGN.md voice rules.
-  const verdict = `${modelLabel} on ${deviceLabel}`
+  //
+  // Three shapes depending on what the trace carries:
+  //   (1) both model + device distinct     → `<model> on <device>` (iOS SDK)
+  //   (2) only one of them OR they're equal → show the single non-empty string
+  //       (CI benchmarks from the Action send the same label twice; an iOS
+  //        trace with `device.model` but no `gen_ai.request.model` falls here
+  //        too)
+  //   (3) neither                           → "Untitled trace"
+  const verdict = composeVerdict(metrics.modelName, metrics.deviceModel)
 
   return (
     <Layout
@@ -93,4 +99,19 @@ export function PublicTracePage({
       </footer>
     </Layout>
   )
+}
+
+/**
+ * Dedupe-aware composition. Kept close to the page (not in `metrics.ts`)
+ * because it's a display concern, not a data transform — `metrics.ts` should
+ * stay pure-data.
+ */
+export function composeVerdict(
+  modelName: string | null,
+  deviceLabel: string | null,
+): string {
+  const m = modelName?.trim() || null
+  const d = deviceLabel?.trim() || null
+  if (m && d && m !== d) return `${m} on ${d}`
+  return m || d || "Untitled trace"
 }
