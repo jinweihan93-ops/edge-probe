@@ -49,7 +49,7 @@ Year 2 P0 — initial scaffolding. The full plan is CONDITIONAL pending gating (
 | `harness/` | Benchmark CLI — `harness run` / `harness diff` (Y1 OSS tool) |
 | `docs/` | Plan, design system, architecture notes |
 | `scripts/` | Dev + CI helpers |
-| `.github/` | Workflows (XCFramework builds on llama.cpp tags, CI matrix) |
+| `.github/` | Workflows (CI matrix across Xcode 16 / 16.1, coverage artifacts) |
 
 ### Quick start
 
@@ -98,7 +98,6 @@ Full setup, launch-arg reference, and the simulator-specific known issues are in
 ### Advanced
 
 - **Benchmark harness** — `harness/` is a separate SwiftPM package that runs prompts through the SDK in dry-run mode. Source of truth for the monthly benchmark posts, and doubles as an SDK integration smoke. CLI usage lives under `harness/`.
-- **XCFramework builds** — `.github/workflows/xcframework.yml` fans out `{ios, ios-simulator, macos} × {arm64, x86_64}` builds on llama.cpp / whisper.cpp upstream tags. Local entry point: `scripts/build-xcframework.sh`.
 
 ---
 
@@ -144,7 +143,7 @@ Year 2 P0 —— 初始脚手架阶段。完整计划为 CONDITIONAL，等待 ga
 | `harness/` | 基准测试 CLI —— `harness run` / `harness diff`（Y1 开源工具） |
 | `docs/` | 计划、设计系统、架构笔记 |
 | `scripts/` | 开发与 CI 辅助脚本 |
-| `.github/` | Workflows（跟随 llama.cpp tag 构建 XCFramework，CI 矩阵） |
+| `.github/` | Workflows（跨 Xcode 16 / 16.1 的 CI 矩阵 + 覆盖率 artifacts） |
 
 ### 快速上手
 
@@ -193,4 +192,3 @@ cd web && bun install && bun test
 ### 进阶
 
 - **基准测试工具** —— `harness/` 是一个独立 SwiftPM 包，以 dry-run 模式把 prompt 跑过 SDK。它既是每月基准文章的 source-of-truth，也兼作 SDK 集成烟雾测试。CLI 用法见 `harness/` 目录。
-- **XCFramework 构建** —— `.github/workflows/xcframework.yml` 跟随 llama.cpp / whisper.cpp 上游 tag 扇出 `{ios, ios-simulator, macos} × {arm64, x86_64}` 构建矩阵。本地入口脚本：`scripts/build-xcframework.sh`。

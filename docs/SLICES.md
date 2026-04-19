@@ -16,13 +16,14 @@ Follow-up work creates a new slice, not a rename.
 - [x] **Slice 5** — Two-key auth finish (`epk_pub_` ingest vs `epk_priv_` dashboard, rotation)
 - [x] **Slice 6** — Per-call `includeContent` + `sensitive=true` projection guard (SDK + backend)
 - [x] **Slice 7** — Six critical regression tests as an explicit named suite
-- [x] **Slice 8** — XCFramework build workflow on upstream tags
+- [x] **Slice 8** — XCFramework build workflow on upstream tags _(retired in Slice 15 — upstream now ships prebuilt xcframeworks for both)_
 - [x] **Slice 9** — Benchmark harness (Y1 OSS tool) — minimal first cut
 - [x] **Slice 10** — VoiceProbe cleanup tail from Slice 0
 - [x] **Slice 11** — Real on-device LLM on simulator via llama.cpp
 - [x] **Slice 12** — Bump `actions/*` to Node 24 runtimes
 - [x] **Slice 13** — Matrix iOS jobs across Xcode current + current-1
 - [x] **Slice 14** — Upload bun + swift coverage artifacts on every PR
+- [x] **Slice 15** — Retire the custom XCFramework workflow (upstream prebuilds cover the need)
 
 ## Slice contracts
 
@@ -348,3 +349,61 @@ target), backend 64.78% lines (72.98% on `server.ts` hot path; the
 drag is `pgApiKeyStore` / `pgSpanStore` / `migrate.ts` which are
 production-only paths), web 90.82% on `server.tsx` with pages all
 100%, action covers cross-package smoke against `../backend`.
+
+### Slice 15 — Retire the custom XCFramework workflow
+
+**Why:** Slice 8 landed a matrix-fan-out workflow that builds llama.cpp
+and whisper.cpp as XCFrameworks, explicitly shipping the SHAPE only
+(`--real` path is a `touch .stub` + log-and-exit stub; no run has ever
+actually compiled). The follow-up to flip `--real` on was gated on
+"once Package.swift consumes the uploaded XCFrameworks." Two things
+have changed since:
+
+1. **Upstream `ggml-org/llama.cpp` ships a prebuilt xcframework on
+   every `bNNNN` tag.** `ios/LlamaRuntime/` already pins it by URL +
+   SHA-256 (tag `b8833`), bypassing our workflow entirely.
+2. **Upstream `ggml-org/whisper.cpp` started publishing a prebuilt
+   xcframework too** (`whisper-v<tag>-xcframework.zip`, first at
+   v1.8.4 on 2026-03-19). The last remaining rationale for a custom
+   whisper build is gone.
+
+VoiceProbe's ASR uses Apple's `SFSpeechRecognizer` (see
+`ios/DemoApp/.../ASRService.swift` — explicitly chosen over whisper.cpp
+per the file's docstring: "Whisper.cpp would be more accurate but
+bigger and off-topic for the SDK demo"), so there's no remaining
+consumer of the workflow's output even if whisper-via-llama.cpp-wrap
+lands later. A future `ios/WhisperRuntime/` would mirror `LlamaRuntime`
+and pin upstream directly, same as llama.
+
+The build flags we planned (`LLAMA_METAL=ON`, `WHISPER_COREML=ON`,
+`BUILD_SHARED_LIBS=OFF`) match what upstream already ships, so there's
+no flag-customization escape hatch we'd lose.
+
+**Scope:**
+- Delete `.github/workflows/xcframework.yml` (~220 lines of YAML).
+- Delete `scripts/build-xcframework.sh` (the orchestration shell
+  script that was still a log-only stub).
+- `docs/SLICES.md`: mark Slice 8 as `(retired in Slice 15 — upstream
+  now ships prebuilt xcframeworks for both)` in the status list.
+  Slice 8's contract section is preserved verbatim for history
+  (append-only slice numbering means we don't rewrite the past; we
+  annotate it).
+- `README.md`: drop the "XCFramework builds" advanced-section bullet
+  (both EN + 中文), and trim the project-layout `.github/` row to
+  just "Workflows (CI matrix)".
+- `.gitignore`: drop the `build/xcframework/` scratch-dir entry —
+  no script will write there anymore.
+
+**Done:** `.github/workflows/xcframework.yml` and
+`scripts/build-xcframework.sh` gone from the tree. `actionlint
+.github/workflows/` covers one fewer file. `bun test` and `swift
+test` unchanged (neither ever touched these files). `git log -p
+4db7036^..HEAD -- .github/workflows/xcframework.yml scripts/build-xcframework.sh`
+is the recoverable history if a future slice actually needs custom
+compilation (e.g., stripping Metal for size).
+
+**Reversibility note:** pulling the workflow back is a `git revert`
+or a cherry-pick from before Slice 15. No data loss, no external
+dependency — upstream's prebuilts live on GitHub Releases, which
+LlamaRuntime already consumes and a hypothetical WhisperRuntime
+would too.
