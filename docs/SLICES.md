@@ -20,6 +20,9 @@ Follow-up work creates a new slice, not a rename.
 - [x] **Slice 9** — Benchmark harness (Y1 OSS tool) — minimal first cut
 - [x] **Slice 10** — VoiceProbe cleanup tail from Slice 0
 - [x] **Slice 11** — Real on-device LLM on simulator via llama.cpp
+- [x] **Slice 12** — Bump `actions/*` to Node 24 runtimes
+- [x] **Slice 13** — Matrix iOS jobs across Xcode current + current-1
+- [x] **Slice 14** — Upload bun + swift coverage artifacts on every PR
 
 ## Slice contracts
 
@@ -252,3 +255,96 @@ descriptions, missing-file throw, raw C-symbol import), and a fresh
 simulator launch produces model-generated tokens (not stub text)
 after the first-launch Qwen GGUF download — no launch arg required
 as of 2026-04-18.
+
+### Slice 12 — Bump `actions/*` to Node 24 runtimes
+
+**Why:** GitHub deprecated Node 20 on Actions 2026-09-19 with a 2026-06-02
+hard cutoff. Every CI annotation had been warning since 2026-04-18.
+Handle the bump before prod runs break, not after.
+
+**Scope:**
+- Probe each action's `action.yml` `using:` field to confirm the chosen
+  tag actually ships on Node 24.
+- Version bumps (Actions-owned repos keep bare-major alias):
+  - `actions/checkout` v4 → v5
+  - `actions/cache` v4 → v5
+  - `actions/upload-artifact` v4 → v7 (v5/v6 still node20)
+  - `actions/download-artifact` v4 → v8 (v5–v7 still node20)
+  - `softprops/action-gh-release` v2 → v3
+- Pin `minor.patch` on third-party actions whose bare-major alias has
+  stopped advancing (per the deprecation warnings' name-check):
+  - `maxim-lobanov/setup-xcode` v1 → v1.7.0
+  - `oven-sh/setup-bun` v2 → v2.2.0
+- Sanity-check release notes for each bump; inputs we pass
+  (`fetch-depth`, `key`, `path`, `name`, `tag_name`, `draft`, `files`)
+  unchanged across the tag jumps.
+
+**Done:** CI passes on `main` and on a fresh PR with zero Node 20
+deprecation annotations in the logs. Change surface is 7 string swaps
+in `.github/workflows/`, trivially bisectable if a regression shows up.
+
+### Slice 13 — Matrix iOS jobs across Xcode current + current-1
+
+**Why:** `docs/TEST-PLAN.md` §CI Matrix calls for Swift toolchain
+coverage across `current + current-1`. The original `ci.yml` explicitly
+deferred it ("lands in month 13 once the XCFramework build job exists").
+Slice 8 shipped that job and Slice 12 unblocked Node 24; runway is now
+clear.
+
+**Scope:**
+- Two matrix cells per iOS-flavored job:
+  - `"16"` — tracks the latest 16.x via `maxim-lobanov/setup-xcode`'s
+    major selector. Catches Swift 6.x patch drift automatically;
+    patch bumps don't churn the workflow file.
+  - `"16.1"` — explicit current-1 pin. When Apple rotates it off the
+    `macos-14` image (as happened to 16.0 on 2026-04-18), THIS cell
+    fails red and forces a deliberate bump rather than accepting the
+    drop silently.
+- Matrix applied to all three iOS-flavored jobs: `ios` (primary suite),
+  `critical-paths-ios` (ship-gating invariants #4–#6), `harness`
+  (benchmark CLI + golden diff).
+- Per-cell cache keys (`swiftpm-<os>-xcode-<version>-<hash>`) so a
+  16.1 `.build/` can't restore on top of a 16.2 run and blow up with
+  opaque module-incompatibility errors. Fallback `restore-keys`
+  preserved for cold-start warmth.
+
+**Done:** `needs.ios.result` still returns `success` only when all
+matrix cells pass, so the `required` aggregator continues to gate
+merges unchanged. Cost: ~+$2.80/PR in macOS runner minutes —
+acceptable for catching Xcode drift before merge.
+
+### Slice 14 — Upload bun + swift coverage artifacts on every PR
+
+**Why:** `docs/TEST-PLAN.md` §Coverage Targets declares `SDK ≥90%
+line coverage` and `Backend 100% of HTTP endpoints + 100% of auth
+boundaries`. Today those targets are folklore — there's no per-PR
+artifact a reviewer can read. Ship coverage observability before
+gating on it.
+
+**Scope:**
+- `bun test --coverage` on the backend job; text reporter goes to
+  stdout so PR-log scanners see per-file numbers without downloading
+  anything, LCOV emitted alongside for downstream integrations
+  (Codecov, Coveralls, Sonar).
+- Swift coverage on the iOS job via
+  `swift test --enable-code-coverage`, extracted with
+  `xcrun llvm-cov export` to LCOV.
+- Coverage captured on the `"16"` Xcode matrix cell only, not `"16.1"`
+  — source-level output is identical across Xcode patch levels, so
+  running it on both cells just duplicates a ~30 KB artifact and
+  invites an artifact-name collision.
+- Artifacts uploaded with 14-day retention — long enough to correlate
+  a regression to its PR without letting old artifacts pile up
+  against the org's storage quota.
+- Day-1 posture is **observability, not gate**. A threshold gate with
+  no baseline data would false-positive on the `pg*` production-only
+  stubs (excluded from the in-memory suite) and cry wolf before
+  anyone has intuition for realistic numbers. `--coverage-threshold`
+  lands in a follow-up slice once a week of baseline data is in.
+
+**Done:** PRs surface `bun-coverage` and `swift-coverage` artifacts.
+Baseline at merge time: iOS SDK 90.73% lines / 82.86% funcs (meets
+target), backend 64.78% lines (72.98% on `server.ts` hot path; the
+drag is `pgApiKeyStore` / `pgSpanStore` / `migrate.ts` which are
+production-only paths), web 90.82% on `server.tsx` with pages all
+100%, action covers cross-package smoke against `../backend`.
