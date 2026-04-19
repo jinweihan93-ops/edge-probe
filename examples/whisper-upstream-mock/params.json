@@ -1,5 +1,5 @@
 {
   "model_size": "tiny",
-  "beam_size": 1,
+  "beam_size": 5,
   "n_threads": 4
 }
