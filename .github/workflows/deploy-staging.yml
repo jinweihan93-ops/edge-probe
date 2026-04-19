@@ -1,0 +1,49 @@
+# Deploy the staging backend to Fly.io.
+#
+# Fires when `backend/**` or this workflow itself changes on main. Manual
+# `workflow_dispatch` is available for re-deploys without a commit (e.g.
+# rotating secrets, warming the machine before a demo).
+#
+# Uses Fly's remote builder (`--remote-only`), so the GitHub runner never
+# needs Docker installed — `flyctl` uploads the build context and Fly
+# builds + deploys. Build time: ~90s cold, ~30s warm.
+#
+# Requires repo secret:
+#   FLY_API_TOKEN    — `fly tokens create deploy -x 999999h -a edgeprobe-staging`
+#                      Scoped to this app only; NOT your personal Fly account token.
+#
+# Concurrency group prevents overlapping deploys from racing Fly's machine
+# replacement. cancel-in-progress=false because a deploy cut short mid-way
+# can leave the app in a mixed-version state — always finish what you started.
+
+name: Deploy staging backend
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - ".github/workflows/deploy-staging.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: flyctl deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Deploy
+        working-directory: backend
+        run: flyctl deploy --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

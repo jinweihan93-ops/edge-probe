@@ -33,6 +33,7 @@ Thumbs.db
 !.vscode/extensions.json
 *.swp
 *.swo
+.claude/
 
 # Logs
 *.log
