@@ -92,9 +92,11 @@ jobs:
             dry_run="false"
           fi
 
-          echo "llama_tag=$llama_tag"     >> "$GITHUB_OUTPUT"
-          echo "whisper_tag=$whisper_tag" >> "$GITHUB_OUTPUT"
-          echo "dry_run=$dry_run"         >> "$GITHUB_OUTPUT"
+          {
+            echo "llama_tag=$llama_tag"
+            echo "whisper_tag=$whisper_tag"
+            echo "dry_run=$dry_run"
+          } >> "$GITHUB_OUTPUT"
 
           echo "── resolved build inputs ───────────────"
           echo "  llama_cpp_tag   = ${llama_tag:-<skip>}"
@@ -139,12 +141,14 @@ jobs:
           DRY_RUN: ${{ needs.resolve.outputs.dry_run }}
         run: |
           set -euo pipefail
+          extra_args=()
+          [ "${DRY_RUN:-true}" = "false" ] && extra_args+=(--real)
           scripts/build-xcframework.sh \
             --target "${{ matrix.target }}" \
             --arch   "${{ matrix.arch }}" \
             --llama-tag   "${LLAMA_CPP_TAG:-}" \
             --whisper-tag "${WHISPER_CPP_TAG:-}" \
-            $([ "${DRY_RUN:-true}" = "false" ] && echo --real)
+            ${extra_args[@]+"${extra_args[@]}"}
 
       - name: Upload slice artifact
         if: ${{ needs.resolve.outputs.dry_run == 'false' }}
@@ -194,7 +198,7 @@ jobs:
         run: |
           set -euo pipefail
           cd build/xcframework/out
-          shasum -a 256 *.zip > SHA256SUMS.txt
+          shasum -a 256 -- *.zip > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Upload GitHub Release
