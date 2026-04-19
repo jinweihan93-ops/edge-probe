@@ -39,11 +39,11 @@ EdgeProbe also ships as a **GitHub Action** for benchmark regressions. Three per
 
 | Demo PR | What changed | What the EdgeProbe comment looks like |
 |---------|--------------|---------------------------------------|
-| `demo/first-run` | new project, no baseline yet | First-trace card, share URL, no regression math |
-| `demo/regression` | `beam_size: 1 → 5` | **Red** — decode +4×, headline +114%, share URL |
-| `demo/green` | `n_threads: 4 → 8` | **Green ✓** — encoder speedup, headline −18% |
+| [#5 `demo/first-run`](https://github.com/jinweihan93-ops/edge-probe/pull/5) | new project, no baseline yet | First-trace card, share URL, no regression math |
+| [#3 `demo/regression`](https://github.com/jinweihan93-ops/edge-probe/pull/3) | `beam_size: 1 → 5` | **Red** — decode +4×, headline +114%, share URL |
+| [#4 `demo/green`](https://github.com/jinweihan93-ops/edge-probe/pull/4) | `n_threads: 4 → 8` | **Green ✓** — encoder speedup, headline −18% |
 
-The synth is deterministic, so every re-run of the same PR produces byte-identical numbers. See [`examples/whisper-upstream-mock/README.md`](examples/whisper-upstream-mock/README.md) for the math and the one-time commands to open the three PRs.
+The synth is deterministic, so every re-run of the same PR produces byte-identical numbers. See [`examples/whisper-upstream-mock/README.md`](examples/whisper-upstream-mock/README.md) for the math behind the numbers.
 
 ### Status
 
@@ -145,11 +145,11 @@ EdgeProbe 同时以 **GitHub Action** 形式发布，用于基准回归检测。
 
 | Demo PR | 改动 | EdgeProbe 评论效果 |
 |---------|------|--------------------|
-| `demo/first-run` | 新项目，尚无 baseline | 首次 trace 卡片 + 分享链接，不做回归比较 |
-| `demo/regression` | `beam_size: 1 → 5` | **红** —— decode +4×，headline +114%，含分享链接 |
-| `demo/green` | `n_threads: 4 → 8` | **绿 ✓** —— encoder 加速，headline −18% |
+| [#5 `demo/first-run`](https://github.com/jinweihan93-ops/edge-probe/pull/5) | 新项目，尚无 baseline | 首次 trace 卡片 + 分享链接，不做回归比较 |
+| [#3 `demo/regression`](https://github.com/jinweihan93-ops/edge-probe/pull/3) | `beam_size: 1 → 5` | **红** —— decode +4×，headline +114%，含分享链接 |
+| [#4 `demo/green`](https://github.com/jinweihan93-ops/edge-probe/pull/4) | `n_threads: 4 → 8` | **绿 ✓** —— encoder 加速，headline −18% |
 
-合成函数是确定性的 —— 同一个 PR 无论重跑多少次，数字都字节级一致。演算逻辑与一次性开 PR 的命令，见 [`examples/whisper-upstream-mock/README.md`](examples/whisper-upstream-mock/README.md)。
+合成函数是确定性的 —— 同一个 PR 无论重跑多少次，数字都字节级一致。演算逻辑见 [`examples/whisper-upstream-mock/README.md`](examples/whisper-upstream-mock/README.md)。
 
 ### 当前状态
 
