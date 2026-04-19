@@ -1,0 +1,25 @@
+{
+  "project": "whisper-upstream-mock",
+  "label": "whisper.cpp synthesized · model=tiny beam=1 threads=4",
+  "headlineMetric": "transcribe_ms",
+  "headlineMs": 91,
+  "totalMs": 184,
+  "turns": [
+    {
+      "turn": 1,
+      "stages": {
+        "whisper": 59,
+        "decode": 32
+      },
+      "totalMs": 91
+    },
+    {
+      "turn": 2,
+      "stages": {
+        "whisper": 61,
+        "decode": 32
+      },
+      "totalMs": 93
+    }
+  ]
+}

@@ -33,6 +33,18 @@ try EdgeProbe.trace(.llm) {
 
 That's the whole pitch. The SDK captures the span, exports it to the backend, and the dashboard renders a waterfall trace.
 
+### See it live on a PR
+
+EdgeProbe also ships as a **GitHub Action** for benchmark regressions. Three permanently-open demo PRs under [`examples/whisper-upstream-mock/`](examples/whisper-upstream-mock/) show the full rendered comment:
+
+| Demo PR | What changed | What the EdgeProbe comment looks like |
+|---------|--------------|---------------------------------------|
+| `demo/first-run` | new project, no baseline yet | First-trace card, share URL, no regression math |
+| `demo/regression` | `beam_size: 1 → 5` | **Red** — decode +4×, headline +114%, share URL |
+| `demo/green` | `n_threads: 4 → 8` | **Green ✓** — encoder speedup, headline −18% |
+
+The synth is deterministic, so every re-run of the same PR produces byte-identical numbers. See [`examples/whisper-upstream-mock/README.md`](examples/whisper-upstream-mock/README.md) for the math and the one-time commands to open the three PRs.
+
 ### Status
 
 Year 2 P0 — initial scaffolding. The full plan is CONDITIONAL pending gating (see `docs/PLAN.md`).
@@ -126,6 +138,18 @@ try EdgeProbe.trace(.llm) {
 ```
 
 这就是全部。SDK 会捕获 span、上报到后端，Dashboard 自动渲染瀑布图。
+
+### 在 PR 上直接看效果
+
+EdgeProbe 同时以 **GitHub Action** 形式发布，用于基准回归检测。[`examples/whisper-upstream-mock/`](examples/whisper-upstream-mock/) 目录下有三个长期开着的 demo PR，可以直接点进去看 Action 渲染的 PR 评论长什么样：
+
+| Demo PR | 改动 | EdgeProbe 评论效果 |
+|---------|------|--------------------|
+| `demo/first-run` | 新项目，尚无 baseline | 首次 trace 卡片 + 分享链接，不做回归比较 |
+| `demo/regression` | `beam_size: 1 → 5` | **红** —— decode +4×，headline +114%，含分享链接 |
+| `demo/green` | `n_threads: 4 → 8` | **绿 ✓** —— encoder 加速，headline −18% |
+
+合成函数是确定性的 —— 同一个 PR 无论重跑多少次，数字都字节级一致。演算逻辑与一次性开 PR 的命令，见 [`examples/whisper-upstream-mock/README.md`](examples/whisper-upstream-mock/README.md)。
 
 ### 当前状态
 

@@ -1,0 +1,89 @@
+# Demo workflow — drives the `examples/whisper-upstream-mock/` demo PRs.
+#
+# What it does on every PR that touches the demo directory:
+#   1. synthesize a trace from params.json  (pure function, deterministic)
+#   2. run the EdgeProbe Action against the baseline
+#   3. sticky-comment the rendered PR comment
+#
+# fail-on-regression is deliberately `false`:
+#   this is a demo. The PR *should* be mergeable even when the comment is
+#   red — otherwise the regression PR would be stuck in "CI failed" purgatory.
+#   The point is to show the comment, not to gate merges.
+#
+# backend-url points at our live staging. Secrets must exist on the repo:
+#   EDGEPROBE_INGEST_KEY     (epk_pub_...)
+#   EDGEPROBE_DASHBOARD_KEY  (epk_priv_...)
+# For PRs opened from forks, secrets are unavailable — the Action silently
+# downgrades to no-share-URL mode, which is the correct behavior (a flaky
+# fork PR shouldn't be able to inject into our staging backend anyway).
+
+name: Demo — whisper upstream mock
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "examples/whisper-upstream-mock/**"
+      - ".github/workflows/example-whisper.yml"
+      - "action/**"
+  workflow_dispatch:
+
+permissions:
+  pull-requests: write
+  contents: read
+
+concurrency:
+  group: example-whisper-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  demo:
+    name: EdgeProbe demo comment
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Synthesize trace from params.json
+        id: synth
+        run: |
+          set -euo pipefail
+          bun run examples/whisper-upstream-mock/bin/synthesize.ts > trace.json
+          echo "── trace.json ──"
+          cat trace.json
+          echo
+
+          # Conditionally forward baseline — first-run demo branches delete
+          # the baseline file on purpose so the Action renders the first-run
+          # variant.
+          if [ -f examples/whisper-upstream-mock/baselines/main.json ]; then
+            echo "baseline=examples/whisper-upstream-mock/baselines/main.json" >> "$GITHUB_OUTPUT"
+          else
+            echo "baseline=" >> "$GITHUB_OUTPUT"
+            echo "── no baseline present; Action will render first-run variant"
+          fi
+
+      - name: EdgeProbe
+        id: edgeprobe
+        uses: ./action
+        with:
+          trace-file: trace.json
+          baseline-file: ${{ steps.synth.outputs.baseline }}
+          threshold: "0.15"
+          fail-on-regression: "false"
+          backend-url: https://edgeprobe-staging.fly.dev
+          ingest-key: ${{ secrets.EDGEPROBE_INGEST_KEY }}
+          dashboard-key: ${{ secrets.EDGEPROBE_DASHBOARD_KEY }}
+          org-id: org_demo
+          project-id: proj_whisper_upstream
+
+      - name: Sticky PR comment
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: edgeprobe-whisper
+          message: ${{ steps.edgeprobe.outputs.comment }}

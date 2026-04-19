@@ -133,6 +133,13 @@ function renderTurnTable(input: CommentInput): string {
 
   const summary = summariseTurnCount(rows)
   const header = `<details>\n<summary>Per-turn diff (${summary})</summary>\n`
+  // TODO(#column-flex): hardcoded to the voice-loop stage vocabulary
+  // (whisper | prefill | decode). Benchmarks with other stage names
+  // (e.g. a pure-TTS pipeline) currently see their stage cells drop out.
+  // Should be derived from the union of stage keys present in the trace,
+  // with a stable order hinted by the trace itself. Safe to defer until
+  // the second non-voice-loop benchmark lands — see
+  // examples/whisper-upstream-mock/bin/synthesize.ts for the workaround.
   const columns = ["Turn", "whisper", "prefill", "decode", "total", "delta"]
   const currentByTurn = new Map(input.current.turns.map((t) => [t.turn, t]))
 
