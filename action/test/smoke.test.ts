@@ -257,6 +257,86 @@ describe("Action smoke — in-process backend", () => {
     expect(result.body).toContain("first trace on voiceprobe-demo")
   })
 
+  test("dashboardUrl (when set) anchors share URL at the dashboard host, not the backend", async () => {
+    // Split-service scenario: backend at edgeprobe-staging.fly.dev returns
+    // JSON for /r/:token; web at edgeprobe-web-staging.fly.dev returns HTML.
+    // The PR comment must link to the web host so humans see the visualization,
+    // not raw JSON. Backend is still the ingest + share-mint target.
+    const deps = makeMemoryDeps(SHARE_SECRET)
+    const app = createApp(deps)
+    const ingestKey = await mintIngestKey(deps)
+    const client = new ActionClient({
+      baseUrl: "http://backend.invalid",
+      dashboardUrl: "http://dashboard.invalid",
+      ingestKey,
+      dashboardKey: TEST_DASHBOARD_KEY_ACME,
+      fetchImpl: honoFetch(app),
+    })
+
+    const result = await runAction({
+      tracePath: await writeTempJson(sampleSummary()),
+      threshold: 0.15,
+      failOnRegression: true,
+      backendUrl: "http://backend.invalid",
+      dashboardUrl: "http://dashboard.invalid",
+      ingestKey,
+      dashboardKey: TEST_DASHBOARD_KEY_ACME,
+      orgId: "org_acme",
+      projectId: "proj_demo",
+      dryRun: false,
+      version: "0.0.1",
+      deps: {
+        readFile: (p) => Bun.file(p).text(),
+        writeOutput: async () => {},
+        client,
+      },
+    })
+
+    expect(result.shareUrl).not.toBeNull()
+    // The critical assertion: the URL is rooted at the dashboard, not the backend.
+    expect(result.shareUrl!).toMatch(/^http:\/\/dashboard\.invalid\/r\//)
+    expect(result.shareUrl!).not.toContain("backend.invalid")
+    expect(result.body).toContain(result.shareUrl!)
+  })
+
+  test("dashboardUrl unset → share URL falls back to backendUrl (v0.1.0 compat)", async () => {
+    // v0.1.0 consumers (e.g. the whisper demo pinned at action-v0.1.0) did not
+    // pass --dashboard-url. Their share URLs must still compose off backendUrl
+    // exactly as before — otherwise pinning an old tag silently changes link
+    // destinations.
+    const deps = makeMemoryDeps(SHARE_SECRET)
+    const app = createApp(deps)
+    const ingestKey = await mintIngestKey(deps)
+    const client = new ActionClient({
+      baseUrl: "http://legacy-backend.invalid",
+      // dashboardUrl intentionally omitted
+      ingestKey,
+      dashboardKey: TEST_DASHBOARD_KEY_ACME,
+      fetchImpl: honoFetch(app),
+    })
+
+    const result = await runAction({
+      tracePath: await writeTempJson(sampleSummary()),
+      threshold: 0.15,
+      failOnRegression: true,
+      backendUrl: "http://legacy-backend.invalid",
+      ingestKey,
+      dashboardKey: TEST_DASHBOARD_KEY_ACME,
+      orgId: "org_acme",
+      projectId: "proj_demo",
+      dryRun: false,
+      version: "0.0.1",
+      deps: {
+        readFile: (p) => Bun.file(p).text(),
+        writeOutput: async () => {},
+        client,
+      },
+    })
+
+    expect(result.shareUrl).not.toBeNull()
+    expect(result.shareUrl!).toMatch(/^http:\/\/legacy-backend\.invalid\/r\//)
+  })
+
   test("bad trace JSON → exit 2 with failure body", async () => {
     const badPath = join(tmpdir(), `edgeprobe-bad-${Math.random().toString(36).slice(2)}.json`)
     await Bun.write(badPath, "{ not valid json")
@@ -308,6 +388,7 @@ describe("summaryToIngestPayload + parseArgs — wire contract", () => {
       "--threshold", "0.20",
       "--fail-on-regression", "false",
       "--backend-url", "https://example.test",
+      "--dashboard-url", "https://dashboard.example.test",
       "--ingest-key", "epk_pub_xxx",
       "--dashboard-key", "epk_dash_yyy",
       "--org", "org_a",
@@ -321,6 +402,7 @@ describe("summaryToIngestPayload + parseArgs — wire contract", () => {
     expect(parsed.threshold).toBe(0.20)
     expect(parsed.failOnRegression).toBe(false)
     expect(parsed.backendUrl).toBe("https://example.test")
+    expect(parsed.dashboardUrl).toBe("https://dashboard.example.test")
     expect(parsed.ingestKey).toBe("epk_pub_xxx")
     expect(parsed.dashboardKey).toBe("epk_dash_yyy")
     expect(parsed.orgId).toBe("org_a")

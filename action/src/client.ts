@@ -30,6 +30,17 @@ export type FetchImpl = (
 export interface ActionClientConfig {
   /** Base URL of the EdgeProbe backend (e.g. `https://edgeprobe.dev`). */
   baseUrl: string
+  /**
+   * Optional base URL of the EdgeProbe dashboard (e.g. `https://edgeprobe.app`).
+   *
+   * When set, share links in the PR comment point at `<dashboardUrl>/r/<token>`
+   * so clicking the link renders the HTML trace viewer (web/) instead of the
+   * raw JSON served directly by the backend.
+   *
+   * Omit for backward compat with v0.1.0: share URLs then compose off
+   * `baseUrl` as before.
+   */
+  dashboardUrl?: string
   /** Ingest key (`epk_pub_…`). */
   ingestKey: string
   /** Dashboard key (`epk_dash_…`). Used to mint the share URL. */
@@ -134,10 +145,16 @@ function randomHex(n: number): string {
 
 export class ActionClient {
   private readonly baseUrl: string
+  private readonly dashboardUrl: string
   private readonly fetchImpl: FetchImpl
 
   constructor(private readonly cfg: ActionClientConfig) {
     this.baseUrl = cfg.baseUrl.replace(/\/$/, "")
+    // Fall back to the backend URL when no dashboard is configured — keeps
+    // v0.1.0 consumers' share URLs unchanged (they get raw JSON, same as
+    // before), while new consumers that opt into `dashboard-url` get the
+    // HTML trace viewer.
+    this.dashboardUrl = (cfg.dashboardUrl ?? cfg.baseUrl).replace(/\/$/, "")
     this.fetchImpl = cfg.fetchImpl ?? fetch
   }
 
@@ -175,7 +192,13 @@ export class ActionClient {
     const shareBody = (await shareRes.json()) as { url: string }
     // `shareBody.url` is path-relative (`/r/:token`). Compose the absolute URL
     // so the PR comment carries a link reviewers can click.
-    const shareUrl = `${this.baseUrl}${shareBody.url}`
+    //
+    // The URL is anchored to `dashboardUrl` (which falls back to `baseUrl`
+    // when unset, preserving v0.1.0 behavior). The split exists because
+    // backend/ and web/ are separate services: `/r/:token` on the backend
+    // returns JSON (for machine consumers), the same path on web/ returns
+    // the HTML trace viewer (for humans opening from a PR).
+    const shareUrl = `${this.dashboardUrl}${shareBody.url}`
     return { traceId: payload.trace.id, shareUrl }
   }
 }

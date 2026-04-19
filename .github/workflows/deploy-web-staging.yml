@@ -1,0 +1,52 @@
+# Deploy the staging web dashboard to Fly.io.
+#
+# Fires when `web/**` or this workflow itself changes on main. Manual
+# `workflow_dispatch` is available for re-deploys without a commit.
+#
+# Parallel to deploy-staging.yml (which deploys the backend). Kept as two
+# workflows instead of one multi-job workflow because:
+#   - path filters are per-workflow, not per-job — a single workflow
+#     would redeploy both apps on any backend/** OR web/** change, losing
+#     the "only touch what changed" property
+#   - independent failure reporting: a web-only template typo shouldn't
+#     mark the backend deploy job red
+#   - FLY_API_TOKEN secrets are scoped per-app by design (principle of
+#     least privilege); putting both in one workflow would muddy that
+#
+# Requires repo secret:
+#   FLY_API_TOKEN_WEB — `fly tokens create deploy -x 999999h -a edgeprobe-web-staging`
+#                       Scoped to the web app only; does NOT authorize backend deploys.
+#
+# Same concurrency rules as the backend deploy (see deploy-staging.yml).
+
+name: Deploy staging web
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - ".github/workflows/deploy-web-staging.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-web-staging
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: flyctl deploy (web)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Deploy
+        working-directory: web
+        run: flyctl deploy --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_WEB }}

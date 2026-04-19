@@ -25,6 +25,10 @@ inputs:
     description: EdgeProbe backend base URL (e.g. https://edgeprobe.dev). Optional — when unset, the Action skips the share-link mint and the comment carries only local numbers.
     required: false
     default: ""
+  dashboard-url:
+    description: EdgeProbe dashboard base URL (e.g. https://edgeprobe.app). Optional — when set, share links in the PR comment point here instead of the backend, so clicking the link renders the HTML trace viewer instead of raw JSON. Falls back to `backend-url` for v0.1.0 compatibility.
+    required: false
+    default: ""
   ingest-key:
     description: Ingest key (epk_pub_…). Required together with `backend-url` and `dashboard-key` to mint a share link.
     required: false
@@ -76,6 +80,7 @@ runs:
         INPUT_THRESHOLD: ${{ inputs.threshold }}
         INPUT_FAIL_ON_REGRESSION: ${{ inputs.fail-on-regression }}
         INPUT_BACKEND_URL: ${{ inputs.backend-url }}
+        INPUT_DASHBOARD_URL: ${{ inputs.dashboard-url }}
         INPUT_INGEST_KEY: ${{ inputs.ingest-key }}
         INPUT_DASHBOARD_KEY: ${{ inputs.dashboard-key }}
         INPUT_ORG_ID: ${{ inputs.org-id }}
@@ -94,6 +99,7 @@ runs:
               --version "$INPUT_VERSION")
         [[ -n "$INPUT_BASELINE_FILE"  ]] && args+=(--baseline "$INPUT_BASELINE_FILE")
         [[ -n "$INPUT_BACKEND_URL"    ]] && args+=(--backend-url "$INPUT_BACKEND_URL")
+        [[ -n "$INPUT_DASHBOARD_URL"  ]] && args+=(--dashboard-url "$INPUT_DASHBOARD_URL")
         [[ -n "$INPUT_INGEST_KEY"     ]] && args+=(--ingest-key "$INPUT_INGEST_KEY")
         [[ -n "$INPUT_DASHBOARD_KEY"  ]] && args+=(--dashboard-key "$INPUT_DASHBOARD_KEY")
         [[ -n "$INPUT_CONFIGURE_URL"  ]] && args+=(--configure-url "$INPUT_CONFIGURE_URL")

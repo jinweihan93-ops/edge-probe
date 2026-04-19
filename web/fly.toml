@@ -1,0 +1,46 @@
+# fly.toml for edgeprobe-web-staging
+#
+# Separate app from edgeprobe-staging (the backend). Reasons:
+#   - Different scaling profile: web is cheap SSR + unfurl fan-in; backend owns
+#     Postgres + ingest throughput.
+#   - Different secret surface: web only needs BACKEND_URL; backend owns
+#     DATABASE_URL, SHARE_TOKEN_SECRET, BOOTSTRAP_API_KEYS.
+#   - Independent deploys: a web-only change (template tweak) should not
+#     redeploy the backend, and vice versa. The deploy workflow filters on
+#     path-scoped changes.
+#
+# Runtime secret (set once via `fly secrets set`):
+#   BACKEND_URL=https://edgeprobe-staging.fly.dev
+
+app = 'edgeprobe-web-staging'
+primary_region = 'iad'
+
+[build]
+
+[env]
+  PORT = '3001'
+
+[processes]
+  app = 'bun run src/server.tsx'
+
+[http_service]
+  internal_port = 3001
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
+
+  [[http_service.checks]]
+    interval = '30s'
+    timeout = '5s'
+    grace_period = '10s'
+    method = 'GET'
+    path = '/healthz'
+
+[[vm]]
+  size = 'shared-cpu-1x'
+  memory = '256mb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 256

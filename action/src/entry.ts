@@ -31,6 +31,7 @@ export interface EntryOptions {
   threshold: number
   failOnRegression: boolean
   backendUrl?: string | undefined
+  dashboardUrl?: string | undefined
   ingestKey?: string | undefined
   dashboardKey?: string | undefined
   orgId: string
@@ -113,6 +114,7 @@ export async function runAction(opts: EntryOptions): Promise<EntryResult> {
   if (canShare) {
     const client = opts.deps?.client ?? new ActionClient({
       baseUrl: opts.backendUrl!,
+      dashboardUrl: opts.dashboardUrl,
       ingestKey: opts.ingestKey!,
       dashboardKey: opts.dashboardKey!,
     })
@@ -229,6 +231,9 @@ export function parseArgs(argv: string[]): Partial<EntryOptions> & { _positional
       case "--backend-url":
         if (next) { out.backendUrl = next; i++ }
         break
+      case "--dashboard-url":
+        if (next) { out.dashboardUrl = next; i++ }
+        break
       case "--ingest-key":
         if (next) { out.ingestKey = next; i++ }
         break
@@ -267,7 +272,7 @@ export const ACTION_VERSION = process.env.EDGEPROBE_ACTION_VERSION ?? "0.0.1"
 export async function main(argv: string[]): Promise<number> {
   const parsed = parseArgs(argv)
   if (!parsed.tracePath) {
-    console.error("usage: edgeprobe-action --trace <file> [--baseline <file>] [--threshold 0.15] [--backend-url …] [--ingest-key …] [--dashboard-key …] [--dry-run]")
+    console.error("usage: edgeprobe-action --trace <file> [--baseline <file>] [--threshold 0.15] [--backend-url …] [--dashboard-url …] [--ingest-key …] [--dashboard-key …] [--dry-run]")
     return 2
   }
   const opts: EntryOptions = {
@@ -276,6 +281,7 @@ export async function main(argv: string[]): Promise<number> {
     threshold: parsed.threshold ?? 0.15,
     failOnRegression: parsed.failOnRegression ?? true,
     backendUrl: parsed.backendUrl ?? process.env.EDGEPROBE_BACKEND_URL,
+    dashboardUrl: parsed.dashboardUrl ?? process.env.EDGEPROBE_DASHBOARD_URL,
     ingestKey: parsed.ingestKey ?? process.env.EDGEPROBE_INGEST_KEY,
     dashboardKey: parsed.dashboardKey ?? process.env.EDGEPROBE_DASHBOARD_KEY,
     orgId: parsed.orgId ?? process.env.EDGEPROBE_ORG_ID ?? "org_unknown",
